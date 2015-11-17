@@ -194,52 +194,67 @@
                                :logged! logged!
                                :result-handler result-handler})))
 
+
+(defn extract!
+  "reads lines from an inputstream and copies to a stringbuilder"
+  [^BufferedReader stream ^StringBuilder logger]
+  (while (.ready stream)
+    (let [line (.readLine stream)]
+      (timbre/info line)
+      (when logger
+        (.append logger (str line "\n"))))))
+
+
+(defn get-out
+  [this {:keys [logged]}]
+  (timbre/debug "get-out: " this)
+  (future
+    (let [chan (:channel this)
+          os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
+          out-stream (-> (:out-stream this) InputStreamReader. BufferedReader.)
+          alive? #(= -1 (.getExitStatus %))]
+      (if (not (.isConnected chan))
+        (.connect chan))
+      (timbre/debug "connected? " (.isConnected chan))
+      (loop [status (alive? chan)]
+        (if status
+          ;; While the channel is still open, read the stdout that was piped to the InputStream
+          (let [line (.readLine os)]
+            (timbre/info line)
+            (when logged
+              (.append logged (str line "\n")))
+            (recur (alive? chan)))
+          ;; There might be info in the BufferedReader once the channel closes, so read it
+          (do
+            (extract! os logged)
+            (extract! out-stream logged)
+            (timbre/info "Finished with status: " (.getExitStatus chan))
+            this))))))
+
 ;; ==========================================================================================
 ;; SSHProcess
 ;; Represents the execution of a SSHCommand
 ;; ==========================================================================================
 (defrecord SSHProcess
-  [channel
-   out-stream
-   err-stream
-   session]
+  [ssh-res]
   Worker
 
   (alive? [this]
-    (let [chan (:channel this)]
+    (let [chan (:channel (:ssh-res this))]
       (= (.getExitStatus chan) -1)))
 
   (get-output [this {:keys [logged]}]
-    (let [chan (:channel this)
-          os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)]
-      (if (not (.isConnected chan))
-        (.connect chan))
-      (println "connected? " (.isConnected chan))
-      (loop [status (alive? this)]
-        (if status
-          ;; While the channel is still open, read the stdout that was piped to the InputStream
-          (let [line (.readLine os)]
-            (println line)
-            (when logged
-              (.append logged (str line "\n")))
-            (recur (alive? this)))
-          ;; There might be info in the BufferedReader once the channel closes, so read it
-          (do
-            (while (.ready os)
-              (let [line (.readLine os)]
-                (println line)
-                (.append logged (str line "\n"))))
-            (println "Finished with status: " (.getExitStatus chan))
-            this)))))
+    (timbre/debug "this is: " this)
+    (get-out (:ssh-res this) {:logged logged}))
 
   (get-status [this]
-    (let [chan (:channel this)]
+    (let [chan (:channel (:ssh-res this))]
       (.getExitStatus chan))))
 
 
 (defn make->SSHProcess
   [ssh-res]
-  (map->SSHProcess ssh-res))
+  (->SSHProcess ssh-res))
 
 
 (defrecord SSHCommander
@@ -251,12 +266,17 @@
    ;; TODO: what else do we need?
    ]
   Executor
+
   (call [this]
     (let [host (:host this)
           cmd (:cmd this)
           logger (:logged! this)
-          ssh-res (make->SSHProcess (ssh host cmd :out :stream))]
-      (future (get-output ssh-res {:logged logger}))))
+          res (ssh host cmd :out :stream)
+          ssh-res (make->SSHProcess res)]
+      (timbre/debug "ssh result:" res)
+      (timbre/debug "SSHProcess:" ssh-res)
+      (get-output ssh-res {:logged logger})))
+
   (output [this]
     (.toString (:logged! this))))
 
@@ -295,4 +315,4 @@
       (clojure.string/trim (output cmd))
       nil)))
 
-;(launch+ "ssh-add")
+;(launch "ssh-add")
