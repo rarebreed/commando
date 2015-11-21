@@ -34,6 +34,7 @@
   "API for a unit of work"
   (alive? [this] "Is the unit of work still in progress (get it's state)")
   (send-input [this] "Send information to the process in real time")
+  (get-data-sink [this] "Get the entity from which to retrieve data")
   ;(get-error [this] "Get any error information from the process")
   (get-status [this] "The status of a process"))
 

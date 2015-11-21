@@ -73,7 +73,7 @@
   (alive? [this]
     (.isAlive this))
 
-  (get-input [this]
+  (get-data-sink [this]
     (let [outp (-> (.getOutputStream this) (OutputStreamWriter.))]
       outp))
 
@@ -166,6 +166,7 @@
                  logger         (mon/make->LogProducer)
                  result-handler (fn [res]
                                   (= 0 (:out res)))
+                 ;; FIXME: need to make a constructor for LogConsumer
                  log-consumers ()
                  topics [:stdout]}
           :as   opts}]
@@ -180,8 +181,8 @@
                                           :logger         logger
                                           :result-handler result-handler
                                           :watch-handler  watch-handler}))]
-    (doseq [topic topics]
-      (subscribe cmdr topic ))))
+    ;; TODO: subscribe the topics
+    cmdr))
 
 ;; ==========================================================================================
 ;; SSHProcess
@@ -191,7 +192,9 @@
   [channel
    out-stream
    err-stream
-   session]
+   session
+   ;; Need to add LogProducer and LogConsumers
+   ]
   Worker
   (alive? [this]
     (let [chan (:channel this)]
@@ -201,10 +204,16 @@
     (let [chan (:channel this)]
       (.getExitStatus chan)))
 
+  (get-data-sink [this]
+    (let [chan (:channel this)]
+      (-> (.getOutputStream chan) OutputStreamWriter.)))
+
   InfoProducer
   (get-output [this {:keys [data]}]
     (let [chan (:channel this)
-          os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)]
+          os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
+          ;; TODO: need to add a core.async channel here
+          ]
       (if (not (.isConnected chan))
         (.connect chan))
       (println "connected? " (.isConnected chan))
@@ -212,6 +221,7 @@
         (if status
           ;; While the channel is still open, read the stdout that was piped to the InputStream
           (let [line (.readLine os)]
+            ;; FIXME:  Use LogProducer/Publisher instead
             (println line)
             (when data
               (.append data (str line "\n")))
@@ -220,6 +230,7 @@
           (do
             (while (.ready os)
               (let [line (.readLine os)]
+                ;; FIXME: use LogProducer/Publisher instead
                 (println line)
                 (.append data (str line "\n"))))
             (println "Finished with status: " (.getExitStatus chan))
@@ -228,6 +239,7 @@
 
 (defn make->SSHProcess
   [ssh-res]
+  ;; TODO:  need to create
   (map->SSHProcess ssh-res))
 
 
