@@ -14,17 +14,30 @@
    ;; a function that possibly transforms a line before being put into log-channel
    transformer
    ;; a list of topics that interested parties can subscribe to
-   topics])
+   topics
+   ;; a list of destinations that data can go to (fan out)
+   destinations
+   ])
+
+
+(def destination-types
+  {:stdout "Goes to the stdout of the main process"
+   :file "a logconsumer that will send consumed messages to a file"
+   :socket "consumed messages will go to a SocketChannel"
+   :channel "consumed messages will to another channel for processing"})
 
 
 (defn make->LogProducer
-  [& {:keys [size out-channel transformer topics]
-      :or {size 10}}]
+  [& {:keys [size out-channel transformer topics destinations]
+      :or {size 10
+           topics []
+           destinations [:stdout]}}]
   (let [out-channel (if out-channel
                       out-channel
                       (-> (chan size) (pub :topic)))
-        topics (atom topics)]
-    (->LogProducer out-channel transformer topics)))
+        topics (atom topics)
+        destinations (atom destinations)]
+    (->LogProducer out-channel transformer topics destinations)))
 
 ;; ==========================================================================================
 ;; LogConsumer
@@ -32,12 +45,15 @@
 ;; a Process which needs to examine log information or events should probably use this
 ;; ==========================================================================================
 (defrecord LogConsumer
-  [in-channel
-   subscribed-to])
+  [in-channel                                               ;; channel to pull messages from
+   subscribed-to                                            ;; what topics to retrieve
+   destination                                              ;; where to send processed message to
+   processor                                                ;; processes a message before sending to destination
+   ])
 
 (defn make->LogConsumer
   [& {:keys [size in-channel subscribed-to]
       :or {size 10
            subscribed-to }}]
   (let [in-channel (chan size)]
-    (doseq [subscription subscribed-to])))
+    ()))
