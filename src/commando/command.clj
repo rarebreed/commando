@@ -1,22 +1,20 @@
 (ns commando.command
   (:require [taoensso.timbre :as timbre]
             [commando.core :refer [items]]
-            [clj-ssh.ssh :as sshs]
             [clj-ssh.cli :as sshc]
             [clojure.string :refer [split]]
-            [commando.protos.protos :refer [Worker InfoProducer Executor Publisher]]
+            [commando.protos.protos :as protos :refer [Worker InfoProducer Executor Publisher]]
             [commando.monitor :as mon]
-            [clojure.core.async :as async :refer [chan pub sub]])
+            [clojure.core.async :as async :refer [chan pub sub]]
+            [commando.logging :refer [get-code]])
   (:import [java.io BufferedReader InputStreamReader OutputStreamWriter]
            [java.lang ProcessBuilder]
            [java.io File]
-           (commando.command InfoProducer)
-           (commando.protos.protos Publisher)
-           (commando.monitor LogProducer)))
+           ))
 
 (sshc/default-session-options {:strict-host-key-checking :no})
 
-;; NOTE: Use this function if you're working at the REPL
+
 (defn ssh
   ""
   [host cmd & {:keys [username loglvl]
@@ -28,47 +26,19 @@
     (timbre/info args)
     (apply sshc/ssh args)))
 
+;; ==========================================================================================
+;; Implementation of InfoProducer on a java.io.File
+;; ==========================================================================================
+(extend-type java.io.File
+  InfoProducer
+  (get-output [this {:keys [data]}]
+    ))
 
-;; NOTE:  This function will not work from the REPL.  If you use this, use it from within
-;; another clojure program (is there a way to tell you are executing from the repl?)
-;; FIXME: This also doesn't appear to be working
-(comment
-  (defn ssh-p
-    "Executes a command on a remote host.
-
-    - host: hostname or IP address to execute cmd on
-    - cmd: the command to execute"
-    [^String host ^String cmd & {:keys [username loglvl pvtkey-path]
-                                 :or   {username "root" loglvl :info pvtkey-path "~/.ssh/id_auto_dsa"}}]
-    (timbre/logf loglvl "On %s| Executing command: %s" host cmd)
-    (let [agent (sshs/ssh-agent {:use-system-ssh-agent true})
-          session (sshs/session agent host {:strict-host-key-checking :no})]
-      (sshs/with-connection session
-                            (sshs/ssh session {:in cmd})))))
 
 ;; ==========================================================================================
-;;
+;; Implementation of a Worker and InfoProducer on a java.lang.Process
 ;; ==========================================================================================
 (extend-type java.lang.Process
-  InfoProducer
-  (get-output
-    [proc {:keys [data]}]
-    (future
-      (let [inp (-> (.getInputStream proc) InputStreamReader. BufferedReader.)
-            out-chan (:out-channel data)]
-        (loop [line (.readLine inp)
-               running? (alive? proc)]
-          ;; FIXME: abstract the println.  What if user doesn't want to print stdout or wants it to
-          ;; to go to a network channel or to a core.async channel?  Make the channel which is already
-          ;; a publisher, publish to println, file handler, etc.
-          (cond line (do
-                       (async/>!! out-chan (str line "\n"))
-                       (recur (.readLine inp) (alive? proc)))
-                (not running?) proc
-                :else (do
-                        (timbre/warn "unknown condition in get-output")
-                        proc))))))
-
   Worker
   (alive? [this]
     (.isAlive this))
@@ -78,7 +48,24 @@
       outp))
 
   (get-status [this]
-    (.exitValue this)))
+    (.exitValue this))
+
+  InfoProducer
+  (get-output [proc {:keys [data]}]
+    (future
+      (let [inp (-> (.getInputStream proc) InputStreamReader. BufferedReader.)
+            out-chan data]
+        (loop [line (.readLine inp)
+               running? (.isAlive proc)]
+          ;; send the message to stdout topic and let the DataTap consumer decide what to do with it
+          ;; TODO: add a fan out (make it a mult channel) so we can send to
+          (cond line (do
+                       (async/>!! out-chan {:topic :stdout :message (str line "\n")})
+                       (recur (.readLine inp) (.isAlive proc)))
+                (not running?) proc
+                :else (do
+                        (timbre/warn "unknown condition in get-output")
+                        proc)))))))
 
 
 ;; ==========================================================================================
@@ -103,6 +90,15 @@
   (.redirectErrorStream pb combine?)
   pb)
 
+
+;; ==========================================================================================
+;; Commander related functions
+;; ==========================================================================================
+(defn get-channel
+  [cmdr]
+  (:data-channel (:logger cmdr)))
+
+
 ;; ==========================================================================================
 ;; Commander
 ;; Represents how to call a local subprocess
@@ -113,8 +109,8 @@
    env                                                      ;; environment map to be used by process
    ^Boolean combine-err?                                    ;; redirect stderr to stdout?
    ^Boolean block?
-   output                                                   ;; channel to send process output to
-   log-consumers                                            ;; seq of LogProducers
+   output                                                   ;; a
+   log-consumer                                             ;; seq of DataTaps which can work on Process messages
    result-handler                                           ;; fn to determine success
    watch-handler                                            ;; function launched in a separate thread
    ]
@@ -128,9 +124,9 @@
           logger (get-channel cmdr)
           proc (.start pb)]
       (if (:block? cmdr)
-        @(get-output proc {:data logger})
+        @(protos/get-output proc {:data logger})
         (do
-          (get-output proc {:data logger})
+          (protos/get-output proc {:data logger})
           proc))))
 
   ;; FIXME: This will no longer work now
@@ -142,33 +138,22 @@
     @(:topics (:logger this)))
   (publish-to [this topic out-chan]
     (let [logprod (:logger this)
-          to-chan (:out-channel logprod)]
+          publisher (:publisher logprod)]
       (swap! (:topics logprod) conj topic)
-      (sub to-chan topic out-chan))))
+      (sub publisher topic out-chan))))
 
-;; ==========================================================================================
-;; Commander related functions
-;; ==========================================================================================
-(defn get-channel
-  [cmdr]
-  (:out-channel (:logger cmdr)))
-
-(defn subscribe
-  "Given a Commander object, subscribe to a given topic"
-  [cmdr topic out-chan]
-  (publish-to cmdr topic out-chan))
 
 (defn make->Commander
-  "Creates a Commander object"
-  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler log-consumers topics]
+  "Creates a Commander object
+
+  The Commander "
+  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler log-consumer topics]
           :or   {combine-err?   true
                  block?         true
-                 logger         (mon/make->LogProducer)
+                 logger         (mon/make->DataSource)
                  result-handler (fn [res]
                                   (= 0 (:out res)))
-                 ;; FIXME: need to make a constructor for LogConsumer
-                 log-consumers ()
-                 topics [:stdout]}
+                 topics         [:stdout]}
           :as   opts}]
   (let [cmdr (map->Commander (merge opts {:cmd            (if (= String (class cmd))
                                                             (split cmd #"\s+")
@@ -180,7 +165,8 @@
                                           :block?         block?
                                           :logger         logger
                                           :result-handler result-handler
-                                          :watch-handler  watch-handler}))]
+                                          :watch-handler  watch-handler
+                                          :log-consumer   (commando.monitor/make->DataTap (:publisher logger))}))]
     ;; TODO: subscribe the topics
     cmdr))
 
@@ -217,7 +203,7 @@
       (if (not (.isConnected chan))
         (.connect chan))
       (println "connected? " (.isConnected chan))
-      (loop [status (alive? this)]
+      (loop [status (= (.getExitStatus chan) -1)]
         (if status
           ;; While the channel is still open, read the stdout that was piped to the InputStream
           (let [line (.readLine os)]
@@ -225,7 +211,7 @@
             (println line)
             (when data
               (.append data (str line "\n")))
-            (recur (alive? this)))
+            (recur (= (.getExitStatus chan) -1)))
           ;; There might be info in the BufferedReader once the channel closes, so read it
           (do
             (while (.ready os)
@@ -238,11 +224,15 @@
 
 
 (defn make->SSHProcess
+  "Constructor for an SSHProcess"
   [ssh-res]
   ;; TODO:  need to create
   (map->SSHProcess ssh-res))
 
 
+;; ==========================================================================================
+;;
+;; ==========================================================================================
 (defrecord SSHCommander
   [^String host
    ^String cmd
@@ -257,7 +247,7 @@
           cmd (:cmd this)
           logger (:logged! this)
           ssh-res (make->SSHProcess (ssh host cmd :out :stream))]
-      (future (get-output ssh-res {:data logger}))))
+      (future (protos/get-output ssh-res {:data logger}))))
   (output [this]
     (.toString (:logged! this))))
 
@@ -277,6 +267,7 @@
           (for [[k v] m]
             [k v])))
 
+
 (defn launch
   "Improved way to launch a command"
   [cmd & {:keys [host]
@@ -284,16 +275,18 @@
   (let [command (if host
                   (make->SSHCommander host cmd)
                   (apply make->Commander cmd (reducer opts)))]
-    [command (call command)]))
+    [command (protos/call command)]))
 
-
-(defn which
-  "Determines if a program is in PATH and if so, returns the path if it exists or nil"
-  [program & {:keys [host]}]
-  (let [[cmd proc] (launch (str "which " program) :host host)
-        proc (if (future? proc) @proc proc)]
-    (if (= 0 (get-status proc))
-      (clojure.string/trim (output cmd))
-      nil)))
+(comment
+  (defn which
+    "Determines if a program is in PATH and if so, returns the path if it exists or nil"
+    [program & {:keys [host]}]
+    (let [[cmd proc] (launch (str "which " program) :host host)
+          proc (if (future? proc) @proc proc)]
+      (if (= 0 (get-status proc))
+        (clojure.string/trim (output cmd))
+        nil))))
 
 ;(launch+ "ssh-add")
+
+(def code (get-code))

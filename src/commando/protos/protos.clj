@@ -1,6 +1,4 @@
-(ns commando.protos.protos
-  (:import (com.sun.xml.internal.ws.transport.http HttpMetadataPublisher)
-           (com.sun.xml.internal.org.jvnet.fastinfoset.sax FastInfosetReader)))
+(ns commando.protos.protos)
 
 
 ;; ==========================================================================================
@@ -25,6 +23,11 @@
   (topics [this] "Returns a list of topics")
   (publish-to [this topic out-chan] "Adds a topic to an outbound channel"))
 
+(defn subscribe
+  "Given a Publisher object, subscribe to a given topic"
+  [cmdr topic out-chan]
+  (publish-to cmdr topic out-chan))
+
 ;; ==========================================================================================
 ;; Worker
 ;; Where Executor encapsulates behavior of _how_ to execute a process, Worker describes
@@ -40,4 +43,4 @@
 
 
 (defprotocol InfoReader
-  )
+  (read-info [this]))

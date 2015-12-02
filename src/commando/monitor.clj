@@ -1,22 +1,18 @@
 (ns commando.monitor
-  (:require [clojure.core.async :as async :refer [go chan !> !!> <! <!! pub sub mult]]
-            [commando.protos.protos :refer [InfoProducer]]))
+  (:require [clojure.core.async :as async :refer [go chan >! >!! <! <!! pub sub mult]]
+            [commando.protos.protos :as protos :refer [InfoProducer]]))
 
 ;; ==========================================================================================
-;; LogProducer
-;; A LogProducer is a process that emits data of some kind and puts it into a channel.  This
-;; can be used by Process types in that they will likely be producing information of interest
-;; to other Processes
+;; DataSource
+;; A DataSource is where data can be sent to, processed and set to other processes
+;; Process will likely be producing information and sending to a DataStore
 ;; ==========================================================================================
-(defrecord LogProducer
-  [;; core.async channel to put lines into
-   out-channel
-   ;; a function that possibly transforms a line before being put into log-channel
-   transformer
-   ;; a list of topics that interested parties can subscribe to
-   topics
-   ;; a list of destinations that data can go to (fan out)
-   destinations
+(defrecord DataStore
+  [data-channel                   ;; core.async channel to put data into
+   publisher                      ;; core.async publisher derived from data-channel
+   transformer                    ;; a function that possibly transforms a line before being put into log-channel
+   topics                         ;; a list of topics that interested parties can subscribe to
+   destinations                   ;; a list of destinations that data can go to (fan out)
    ])
 
 
@@ -27,33 +23,49 @@
    :channel "consumed messages will to another channel for processing"})
 
 
-(defn make->LogProducer
-  [& {:keys [size out-channel transformer topics destinations]
+(defn make->DataSource
+  [& {:keys [size data-channel publisher transformer topics destinations]
       :or {size 10
            topics []
            destinations [:stdout]}}]
-  (let [out-channel (if out-channel
-                      out-channel
-                      (-> (chan size) (pub :topic)))
+  (let [data-channel (if data-channel
+                      data-channel
+                      (-> (chan size)))
+        publisher (if publisher publisher (pub data-channel :topic))
         topics (atom topics)
         destinations (atom destinations)]
-    (->LogProducer out-channel transformer topics destinations)))
+    (->DataStore data-channel publisher transformer topics destinations)))
 
 ;; ==========================================================================================
-;; LogConsumer
-;; A LogConsumer is a process which takes data out of a channel and does something with it
+;; DataTap
+;; A DataTap is a process which takes data out of a channel and does something with it
 ;; a Process which needs to examine log information or events should probably use this
 ;; ==========================================================================================
-(defrecord LogConsumer
+(defn sys-write
+  [chan]
+  (go
+    (loop [msg (<! chan)]
+      (when msg
+        (println (clojure.string/trim-newline (:message msg)))
+        (recur (<! chan))))))
+
+
+(defrecord DataTap
   [in-channel                                               ;; channel to pull messages from
-   subscribed-to                                            ;; what topics to retrieve
+   out-channel                                              ;; where messages from publisher will go
+   topic                                                    ;; topic this Datatap receives
    destination                                              ;; where to send processed message to
-   processor                                                ;; processes a message before sending to destination
+   process                                                ;; a function that takes a channel
    ])
 
-(defn make->LogConsumer
-  [& {:keys [size in-channel subscribed-to]
-      :or {size 10
-           subscribed-to }}]
-  (let [in-channel (chan size)]
-    ()))
+
+(defn make->DataTap
+  [publisher & {:keys [in-channel data-channel topic destination process]
+                :or   {topic        :stdout
+                       data-channel (chan 10)
+                       process      sys-write}}]
+  (sub publisher topic data-channel)
+  (let [dt (->DataTap in-channel data-channel topic destination process)
+        pfn (:process dt)]
+    (pfn data-channel)
+    dt))
