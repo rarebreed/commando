@@ -99,6 +99,10 @@
   (:data-channel (:logger cmdr)))
 
 
+(defn default-res-hdler [res]
+  (= 0 (:out res)))
+
+
 ;; ==========================================================================================
 ;; Commander
 ;; Represents how to call a local subprocess
@@ -109,10 +113,10 @@
    env                                                      ;; environment map to be used by process
    ^Boolean combine-err?                                    ;; redirect stderr to stdout?
    ^Boolean block?
-   output                                                   ;; a
+   logger                                                   ;; a DataStore
    log-consumer                                             ;; seq of DataTaps which can work on Process messages
    result-handler                                           ;; fn to determine success
-   watch-handler                                            ;; function launched in a separate thread
+   watch-handler                                            ;; function to pass to a DataTap
    ]
   Executor
   (call [cmdr]
@@ -150,12 +154,14 @@
   [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler log-consumer topics]
           :or   {combine-err?   true
                  block?         true
-                 logger         (mon/make->DataSource)
-                 result-handler (fn [res]
-                                  (= 0 (:out res)))
+                 logger         (mon/make->DataStore)
+                 result-handler default-res-hdler
                  topics         [:stdout]}
           :as   opts}]
-  (let [cmdr (map->Commander (merge opts {:cmd            (if (= String (class cmd))
+  (let [logc (if log-consumer
+               log-consumer
+               (commando.monitor/make->DataTap (:publisher logger)))
+        cmdr (map->Commander (merge opts {:cmd            (if (= String (class cmd))
                                                             (split cmd #"\s+")
                                                             cmd)
                                           :work-dir       (when work-dir
@@ -166,7 +172,7 @@
                                           :logger         logger
                                           :result-handler result-handler
                                           :watch-handler  watch-handler
-                                          :log-consumer   (commando.monitor/make->DataTap (:publisher logger))}))]
+                                          :log-consumer   logc}))]
     ;; TODO: subscribe the topics
     cmdr))
 
@@ -199,28 +205,29 @@
     (let [chan (:channel this)
           os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
           ;; TODO: need to add a core.async channel here
-          ]
+          out-chan data]
       (if (not (.isConnected chan))
         (.connect chan))
-      (println "connected? " (.isConnected chan))
-      (loop [status (= (.getExitStatus chan) -1)]
-        (if status
+      (timbre/info "connected? " (.isConnected chan))
+      ;; While the ssh child process is active, read from the outputstream and shove it into the
+      ;; the data logger channel
+      (loop [running? (= (.getExitStatus chan) -1)]
+        (when running?
           ;; While the channel is still open, read the stdout that was piped to the InputStream
           (let [line (.readLine os)]
-            ;; FIXME:  Use LogProducer/Publisher instead
-            (println line)
-            (when data
-              (.append data (str line "\n")))
-            (recur (= (.getExitStatus chan) -1)))
-          ;; There might be info in the BufferedReader once the channel closes, so read it
-          (do
-            (while (.ready os)
-              (let [line (.readLine os)]
-                ;; FIXME: use LogProducer/Publisher instead
-                (println line)
-                (.append data (str line "\n"))))
-            (println "Finished with status: " (.getExitStatus chan))
-            this))))))
+            (cond line (do
+                         (async/>!! out-chan {:topic :stdout :message (str line "\n")})
+                         (recur (= (.getExitStatus chan) -1)))
+                  (not running?) (timbre/info "Process exited")
+                  :else (timbre/warn "Unknown condition")))))
+      ;; There might be info in the BufferedReader once the channel closes, so read it
+      (while (.ready os)
+        (let [line (.readLine os)]
+          ;; FIXME: use LogProducer/Publisher instead
+          (when line
+            (async/>!! out-chan {:topic :stdout :message (str line "\n")}))))
+      (println "Finished with status: " (.getExitStatus chan))
+      this)))
 
 
 (defn make->SSHProcess
@@ -234,29 +241,43 @@
 ;;
 ;; ==========================================================================================
 (defrecord SSHCommander
-  [^String host
-   ^String cmd
-   ^StringBuilder logged!
-   result-handler
-   watch-handler
-   ;; TODO: what else do we need?
-   ]
+  [^String host                                             ;; The hostname or IP address of remote machine
+   ^String cmd                                              ;; The command to run
+   logger                                                   ;; A DataStore that the SSHProcess will send data to
+   log-consumer                                             ;; A DataTap
+   result-handler                                           ;; How to determine pass/fail
+   topics
+   ;; TODO: add working directory and environment variables
+   env
+   work-dir]
   Executor
   (call [this]
     (let [host (:host this)
           cmd (:cmd this)
-          logger (:logged! this)
+          logger (:logger this)
           ssh-res (make->SSHProcess (ssh host cmd :out :stream))]
       (future (protos/get-output ssh-res {:data logger}))))
   (output [this]
-    (.toString (:logged! this))))
+    (.toString (:logger this))))
 
 
 (defn make->SSHCommander
-  [host cmd & {:keys [logger result-handler watch-handler]
-               :or {logger (StringBuilder. 1024)}
+  "Creates a new SSHCommander object
+
+  The logger is a DataStore that the ssh process output will go to.  The log-consumer is a DataTap that will
+  pull messages from the DataStore's publisher channel.  The topics sequence determines what messages it will
+  retrieve from the DataStore's publisher channel (because those are the topics it will subscribe to)"
+  [host cmd & {:keys [logger log-consumer result-handler topics env work-dir]
+               :or {logger (mon/make->DataStore)
+                    result-handler default-res-hdler
+                    topics [:stdout]}
                :as opts}]
-  (let [m {:host host :cmd cmd :logger logger :result-handler result-handler :watch-handler watch-handler}]
+  ;; TODO: do we create a DataTap log-consumer per topic?  or do we just subscribe to multiple topics?
+  (let [logc (if log-consumer
+               log-consumer
+               (commando.monitor/make->DataTap (:publisher logger)))
+        m {:host host :cmd cmd :logger logger :log-consumer logc :result-handler result-handler
+           :topics topics :env env :work-dir work-dir}]
     (println m)
     (map->SSHCommander m)))
 
