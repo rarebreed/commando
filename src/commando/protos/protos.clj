@@ -41,6 +41,10 @@
   ;(get-error [this] "Get any error information from the process")
   (get-status [this] "The status of a process"))
 
-
 (defprotocol InfoReader
   (read-info [this]))
+
+(defprotocol Multicaster
+  (listeners [this] "Returns who is listening")
+  (tap-into [this to-chan] "Allows a channel to tap into this")
+  (untap-from [this from-chan] "Untaps a channel from this"))

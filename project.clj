@@ -7,7 +7,8 @@
                  [clj-ssh "0.5.11"]
                  [com.taoensso/timbre "4.1.4"]
                  [org.clojure/core.async "0.2.371"]
-                 [org.clojure/core.match "0.3.0-alpha4"]]
+                 [org.clojure/core.match "0.3.0-alpha4"]
+                 [clj-time "0.11.0"]]
 
   :repl-options {:init-ns commando.command}
   )

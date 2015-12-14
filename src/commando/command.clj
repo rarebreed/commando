@@ -3,10 +3,11 @@
             [commando.core :refer [items]]
             [clj-ssh.cli :as sshc]
             [clojure.string :refer [split]]
-            [commando.protos.protos :as protos :refer [Worker InfoProducer Executor Publisher]]
+            [commando.protos.protos :as protos :refer [Worker InfoProducer Executor Publisher Multicaster]]
             [commando.monitor :as mon]
             [clojure.core.async :as async :refer [chan pub sub]]
-            [commando.logging :refer [get-code]])
+            [commando.logging :refer [get-code]]
+            [clojure.core.match :refer [match]])
   (:import [java.io BufferedReader InputStreamReader OutputStreamWriter]
            [java.lang ProcessBuilder]
            [java.io File]
@@ -52,20 +53,21 @@
 
   InfoProducer
   (get-output [proc {:keys [data]}]
-    (future
-      (let [inp (-> (.getInputStream proc) InputStreamReader. BufferedReader.)
-            out-chan data]
-        (loop [line (.readLine inp)
-               running? (.isAlive proc)]
-          ;; send the message to stdout topic and let the DataTap consumer decide what to do with it
-          ;; TODO: add a fan out (make it a mult channel) so we can send to
-          (cond line (do
-                       (async/>!! out-chan {:topic :stdout :message (str line "\n")})
-                       (recur (.readLine inp) (.isAlive proc)))
-                (not running?) proc
-                :else (do
-                        (timbre/warn "unknown condition in get-output")
-                        proc)))))))
+    (let [inp (-> (.getInputStream proc) InputStreamReader. BufferedReader.)
+          out-chan data]
+      (loop [ready? (.ready inp)
+             running? (.isAlive proc)]
+        (match [[ready? running?]]
+               ;; If the process isn't running and there's nothing in inp, we're done
+               [[false false]] (do
+                                 (async/close! out-chan)
+                                 proc)
+               ;; Process is still going, but nothing is available in buffer: keep going
+               [[false true]] (recur (.ready inp) (.isAlive proc))
+               ;; If there's something in buffer, we don't care if process is alive or not.  grab data
+               [[true _]] (let [line (.readLine inp)]
+                            (async/>!! out-chan {:topic :stdout :message (str line "\n")})
+                            (recur (.ready inp) (.isAlive proc))))))))
 
 
 ;; ==========================================================================================
@@ -114,7 +116,7 @@
    ^Boolean combine-err?                                    ;; redirect stderr to stdout?
    ^Boolean block?
    logger                                                   ;; a DataStore
-   log-consumer                                             ;; seq of DataTaps which can work on Process messages
+   data-consumers                                           ;; a seq of DataTaps which can work on Process messages
    result-handler                                           ;; fn to determine success
    watch-handler                                            ;; function to pass to a DataTap
    ]
@@ -128,10 +130,8 @@
           logger (get-channel cmdr)
           proc (.start pb)]
       (if (:block? cmdr)
-        @(protos/get-output proc {:data logger})
-        (do
-          (protos/get-output proc {:data logger})
-          proc))))
+        (protos/get-output proc {:data logger})
+        (future (protos/get-output proc {:data logger})))))
 
   ;; FIXME: This will no longer work now
   (output [cmdr]
@@ -144,23 +144,37 @@
     (let [logprod (:logger this)
           publisher (:publisher logprod)]
       (swap! (:topics logprod) conj topic)
-      (sub publisher topic out-chan))))
+      (sub publisher topic out-chan)))
+
+  Multicaster
+  (listeners [this]
+    (:data-consumers this))
+
+  (tap-into [this to-chan]
+    (let [multicaster (:logger this)]
+      (async/tap multicaster to-chan)))
+
+  (untap-from [this from-chan]
+    (let [multicaster (:logger this)]
+      (async/untap multicaster from-chan))))
 
 
 (defn make->Commander
   "Creates a Commander object
 
   The Commander "
-  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler log-consumer topics]
+  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler data-consumers topics]
           :or   {combine-err?   true
                  block?         true
-                 logger         (mon/make->DataStore)
+                 logger         (mon/make->DataBus)         ;;(mon/make->DataStore)
                  result-handler default-res-hdler
                  topics         [:stdout]}
           :as   opts}]
-  (let [logc (if log-consumer
-               log-consumer
-               (commando.monitor/make->DataTap (:publisher logger)))
+  (let [logc (if data-consumers
+               data-consumers
+               (commando.monitor/create-default-consumers (:multicaster logger))
+               ;(commando.monitor/make->DataTap (:multicaster logger))
+               )
         cmdr (map->Commander (merge opts {:cmd            (if (= String (class cmd))
                                                             (split cmd #"\s+")
                                                             cmd)
@@ -172,9 +186,37 @@
                                           :logger         logger
                                           :result-handler result-handler
                                           :watch-handler  watch-handler
-                                          :log-consumer   logc}))]
-    ;; TODO: subscribe the topics
+                                          :data-consumers   logc}))]
     cmdr))
+
+
+(defn get-output-ssh
+  [this {:keys [data]}]
+  (let [chan (:channel this)
+        os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
+        out-chan (:data-channel data)
+        is-done? #(= (.getExitStatus chan) -1)
+        finish #(let [status (.getExitStatus chan)]
+                 (async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
+                 (async/close! out-chan)
+                 this)]
+    (if (not (.isConnected chan))
+      (.connect chan))
+    (timbre/info "connected? " (.isConnected chan))
+    ;; While the buffer has data read from the outputstream and shove it into the the data logger channel
+    (loop [ready? (.ready os)
+           running? (is-done?)]
+      (match [[ready? running?]]
+             ;; If process is done, and there's nothing in buffer, we're done
+             [[false false]] (finish)
+             [[false nil]] (finish)
+             ;; if process is still running, but buffer has no data, keep going
+             [[false true]] (recur (.ready os) (is-done?))
+             ;; if we've got data in the buffer, we dont care if process is done or not.  grab the data
+             [[true _]] (let [line (.readLine os)]
+                          (when line
+                            (async/>!! out-chan {:topic :stdout :message (str line "\n")}))
+                          (recur (.ready os) (is-done?)))))))
 
 ;; ==========================================================================================
 ;; SSHProcess
@@ -202,32 +244,7 @@
 
   InfoProducer
   (get-output [this {:keys [data]}]
-    (let [chan (:channel this)
-          os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
-          ;; TODO: need to add a core.async channel here
-          out-chan data]
-      (if (not (.isConnected chan))
-        (.connect chan))
-      (timbre/info "connected? " (.isConnected chan))
-      ;; While the ssh child process is active, read from the outputstream and shove it into the
-      ;; the data logger channel
-      (loop [running? (= (.getExitStatus chan) -1)]
-        (when running?
-          ;; While the channel is still open, read the stdout that was piped to the InputStream
-          (let [line (.readLine os)]
-            (cond line (do
-                         (async/>!! out-chan {:topic :stdout :message (str line "\n")})
-                         (recur (= (.getExitStatus chan) -1)))
-                  (not running?) (timbre/info "Process exited")
-                  :else (timbre/warn "Unknown condition")))))
-      ;; There might be info in the BufferedReader once the channel closes, so read it
-      (while (.ready os)
-        (let [line (.readLine os)]
-          ;; FIXME: use LogProducer/Publisher instead
-          (when line
-            (async/>!! out-chan {:topic :stdout :message (str line "\n")}))))
-      (println "Finished with status: " (.getExitStatus chan))
-      this)))
+    (get-output-ssh this {:data data})))
 
 
 (defn make->SSHProcess
@@ -244,9 +261,10 @@
   [^String host                                             ;; The hostname or IP address of remote machine
    ^String cmd                                              ;; The command to run
    logger                                                   ;; A DataStore that the SSHProcess will send data to
-   log-consumer                                             ;; A DataTap
+   data-consumers                                            ;; A sequence of DataTaps
    result-handler                                           ;; How to determine pass/fail
    topics
+   block?
    ;; TODO: add working directory and environment variables
    env
    work-dir]
@@ -255,8 +273,13 @@
     (let [host (:host this)
           cmd (:cmd this)
           logger (:logger this)
-          ssh-res (make->SSHProcess (ssh host cmd :out :stream))]
-      (future (protos/get-output ssh-res {:data logger}))))
+          ssh-res (make->SSHProcess (ssh host cmd :out :stream))
+          block? (:block? this)]
+      (print "block is " block?)
+      (if block?
+        (protos/get-output ssh-res {:data logger})
+        (future (protos/get-output ssh-res {:data logger})))))
+
   (output [this]
     (.toString (:logger this))))
 
@@ -264,29 +287,30 @@
 (defn make->SSHCommander
   "Creates a new SSHCommander object
 
-  The logger is a DataStore that the ssh process output will go to.  The log-consumer is a DataTap that will
-  pull messages from the DataStore's publisher channel.  The topics sequence determines what messages it will
-  retrieve from the DataStore's publisher channel (because those are the topics it will subscribe to)"
-  [host cmd & {:keys [logger log-consumer result-handler topics env work-dir]
-               :or {logger (mon/make->DataStore)
+  The logger is a DataStore that the ssh process output will go to.  The data-consumers are DataTaps that will
+  receive messages from the DataStore's multicaster channel."
+  [host cmd & {:keys [logger data-consumers result-handler topics block? env work-dir]
+               :or {logger (mon/make->DataBus)              ;;(mon/make->DataStore)
                     result-handler default-res-hdler
-                    topics [:stdout]}
+                    topics [:stdout]
+                    block? true}
                :as opts}]
   ;; TODO: do we create a DataTap log-consumer per topic?  or do we just subscribe to multiple topics?
-  (let [logc (if log-consumer
-               log-consumer
-               (commando.monitor/make->DataTap (:publisher logger)))
-        m {:host host :cmd cmd :logger logger :log-consumer logc :result-handler result-handler
-           :topics topics :env env :work-dir work-dir}]
-    (println m)
+  (let [logc (if data-consumers
+               data-consumers
+               (commando.monitor/create-default-consumers (:multicaster logger))
+               ;(commando.monitor/make->DataTap (:multicaster logger))
+               )
+        m {:host host :cmd cmd :logger logger :data-consumers logc :result-handler result-handler
+           :topics topics :block? block? :env env :work-dir work-dir}]
+    (timbre/info m)
     (map->SSHCommander m)))
 
 
 (defn reducer [m]
   "flattens a map (one-level) by turning it into a sequence of (k1 v1 k2 v2 ..)"
-  (reduce #(concat %1 %2) []
-          (for [[k v] m]
-            [k v])))
+  (reduce #(concat %1 %2) [] (for [[k v] m]
+                               [k v])))
 
 
 (defn launch
@@ -294,8 +318,9 @@
   [cmd & {:keys [host]
           :as opts}]
   (let [command (if host
-                  (make->SSHCommander host cmd)
+                  (apply make->SSHCommander host cmd (reducer opts))
                   (apply make->Commander cmd (reducer opts)))]
+    (timbre/info "opts for launch are: " opts)
     [command (protos/call command)]))
 
 (comment
