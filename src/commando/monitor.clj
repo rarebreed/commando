@@ -97,28 +97,25 @@
   [chan dest hdlr]
   (go
     (loop [msg (<! chan)]
-      (println "in dispatch loop")
       (if (not (nil? msg))
         ;; FIXME: we are assuming :message is a string
-        (let [content (clojure.string/trim-newline (:message msg))
+        (let [message (:message msg)
               content (if hdlr
-                        (hdlr content)
-                        content)]
+                        (hdlr message)
+                        message)]
           ;; FIXME:  matches are exclusive, ie can't match on more than one destination
           (match [dest]
-                 [{:stdout out}] (println content)
+                 [{:stdout out}] (println (clojure.string/trim-newline content))
                  [{:file fpath}] (spit fpath content :append true)
                  [{:socket sock}] nil                       ;; TODO
                  [{:channel mchan}] (>! mchan content)
                  [{:in-mem data}] (.append data content)    ;; FIXME: in-mem can be an arbitrary data type
                  :else (timbre/error "Unknown destination type " dest))
           (recur (<! chan)))
-        (timbre/info "Channel is closed")))))
+        (timbre/info "Channel is closed for" (first (keys dest)))))))
 
 (defrecord DataTap
-  [in-channel                                               ;; channel to pull messages from
-   data-channel                                             ;; where messages from publisher will go
-   ;topic                                                   ;; topic this Datatap receives
+  [data-channel                                             ;; where messages from publisher will go
    destination                                              ;; where to send processed message to
    handler
    process                                                  ;; a function that takes a channel and a destination
@@ -130,13 +127,13 @@
   to the given data-channel (or a default one will be created).  A processing function will pull
   messages from the data-channel, optionally apply a handler to the message.
   "
-  [publisher & {:keys [in-channel data-channel destination handler process]
+  [publisher & {:keys [data-channel destination handler process]
                 :or   {data-channel (chan 10)
                        destination  {:stdout *out*}
                        process      dispatcher}}]
   ;; Tap into the multicaster
   (async/tap publisher data-channel)
-  (let [dt (->DataTap in-channel data-channel destination handler process)
+  (let [dt (->DataTap data-channel destination handler process)
         pfn (:process dt)]
     ;; create the dispatcher core.async process
     (pfn data-channel destination handler)
@@ -179,12 +176,14 @@
   "Creates DataTaps based on destinations.  By default, creates one for showing data to stdout, and
   another that saves data to a StringBuilder"
   ([publisher destinations]
-   (for [d destinations]
-     (make->DataTap publisher :destination d)))
+   (let [datataps (for [d destinations]
+                    (let [name (-> (second d) keys first)]
+                      [name (apply make->DataTap publisher d)]))]
+     (apply hash-map (flatten datataps))))
   ([publisher]
-   (let [dest [{:stdout *out*}
-               {:file *default-log*}
-               {:in-mem (StringBuilder.)}]]
+   (let [dest [[:destination {:stdout *out*}]
+               [:destination {:file *default-log*} :data-channel (chan (async/sliding-buffer 100))]
+               [:destination {:in-mem (StringBuilder.)}]]]
      (create-default-consumers publisher dest))))
 
 ;; =============================================================================
@@ -195,3 +194,9 @@
 (defn create-file-datatap
   [fpath]
   )
+
+
+;; =============================================================================
+;; A File watcher
+;; Can be used to monitor
+;; =============================================================================

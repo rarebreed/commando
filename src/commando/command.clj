@@ -172,8 +172,13 @@
           :as   opts}]
   (let [logc (if data-consumers
                data-consumers
-               (commando.monitor/create-default-consumers (:multicaster logger))
-               ;(commando.monitor/make->DataTap (:multicaster logger))
+               ;(commando.monitor/create-default-consumers (:multicaster logger))
+               [(commando.monitor/make->DataTap (:multicaster logger))
+                (commando.monitor/make->DataTap (:multicaster logger)
+                                                :destination {:in-mem (StringBuilder.)})
+                (commando.monitor/make->DataTap (:multicaster logger)
+                                                :destination {:file "/tmp/commando.log"}
+                                                :data-channel (chan (async/sliding-buffer 100)))]
                )
         cmdr (map->Commander (merge opts {:cmd            (if (= String (class cmd))
                                                             (split cmd #"\s+")
@@ -295,13 +300,13 @@
                     topics [:stdout]
                     block? true}
                :as opts}]
-  ;; TODO: do we create a DataTap log-consumer per topic?  or do we just subscribe to multiple topics?
   (let [logc (if data-consumers
                data-consumers
-               (commando.monitor/create-default-consumers (:multicaster logger))
-               ;(commando.monitor/make->DataTap (:multicaster logger))
-               )
-        m {:host host :cmd cmd :logger logger :data-consumers logc :result-handler result-handler
+               (commando.monitor/create-default-consumers (:multicaster logger)))
+        cmd+ (if work-dir
+               (str (format "cd %s;" work-dir) cmd)
+               cmd)
+        m {:host host :cmd cmd+ :logger logger :data-consumers logc :result-handler result-handler
            :topics topics :block? block? :env env :work-dir work-dir}]
     (timbre/info m)
     (map->SSHCommander m)))
