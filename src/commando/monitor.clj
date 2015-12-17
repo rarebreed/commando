@@ -201,6 +201,3 @@
 ;; A File watcher
 ;; Can be used to monitor
 ;; =============================================================================
-(defn watch-file
-  [fname]
-  (let [watcher ]))
