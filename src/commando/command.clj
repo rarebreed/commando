@@ -341,3 +341,6 @@
 ;(launch+ "ssh-add")
 
 (def code (get-code))
+
+(def status
+  [])

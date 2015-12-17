@@ -2,7 +2,8 @@
   (:require [clojure.core.async :as async :refer [go chan >! >!! <! <!! pub sub mult]]
             [commando.protos.protos :as protos :refer [InfoProducer]]
             [clojure.core.match :refer [match]]
-            [taoensso.timbre :as timbre]))
+            [taoensso.timbre :as timbre])
+  (:import [java.nio.file.StandardWatchEventKinds ]))
 
 ;; TODO: get the current time
 (defn timestamped-name
@@ -200,3 +201,6 @@
 ;; A File watcher
 ;; Can be used to monitor
 ;; =============================================================================
+(defn watch-file
+  [fname]
+  (let [watcher ]))
