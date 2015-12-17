@@ -42,9 +42,29 @@
   (get-status [this] "The status of a process"))
 
 (defprotocol InfoReader
-  (read-info [this]))
+  (get-data [this]))
 
 (defprotocol Multicaster
   (listeners [this] "Returns who is listening")
   (tap-into [this to-chan] "Allows a channel to tap into this")
   (untap-from [this from-chan] "Untaps a channel from this"))
+
+;; =====================================================================================
+;; get-data takes a DataTap, and determines the destination type
+;; based on destination type, it can retrieve data from the DataTap
+;; =====================================================================================
+(defmulti get-data
+          "Retrieve data from a DataTap based on destination type"
+          (fn [this]
+            (let [dtype (-> (:destination this) keys first)]
+              dtype)))
+
+(defmethod get-data :in-mem
+  [this]
+  (let [sb (-> (:destination this) :in-mem)]
+    (.toString sb)))
+
+(defmethod get-data :file
+  [this]
+  (let [fpath (-> (:destination this) :file)]
+    (slurp fpath)))

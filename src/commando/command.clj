@@ -133,9 +133,8 @@
         (protos/get-output proc {:data logger})
         (future (protos/get-output proc {:data logger})))))
 
-  ;; FIXME: This will no longer work now
   (output [cmdr]
-    (.toString (get-channel cmdr)))
+    (protos/get-data (-> (:data-consumers cmdr) :in-mem)))
 
   Publisher
   (topics [this]
@@ -172,14 +171,7 @@
           :as   opts}]
   (let [logc (if data-consumers
                data-consumers
-               ;(commando.monitor/create-default-consumers (:multicaster logger))
-               [(commando.monitor/make->DataTap (:multicaster logger))
-                (commando.monitor/make->DataTap (:multicaster logger)
-                                                :destination {:in-mem (StringBuilder.)})
-                (commando.monitor/make->DataTap (:multicaster logger)
-                                                :destination {:file "/tmp/commando.log"}
-                                                :data-channel (chan (async/sliding-buffer 100)))]
-               )
+               (commando.monitor/create-default-consumers (:multicaster logger)))
         cmdr (map->Commander (merge opts {:cmd            (if (= String (class cmd))
                                                             (split cmd #"\s+")
                                                             cmd)
@@ -286,7 +278,7 @@
         (future (protos/get-output ssh-res {:data logger})))))
 
   (output [this]
-    (.toString (:logger this))))
+    (protos/get-data (-> (:data-consumers this) :in-mem))))
 
 
 (defn make->SSHCommander
