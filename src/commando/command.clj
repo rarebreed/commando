@@ -5,7 +5,7 @@
             [clojure.string :refer [split]]
             [commando.protos.protos :as protos :refer [Worker InfoProducer Executor Publisher Multicaster]]
             [commando.monitor :as mon]
-            [clojure.core.async :as async :refer [chan pub sub]]
+            [clojure.core.async :as async :refer [go chan pub sub]]
             [commando.logging :refer [get-code]]
             [clojure.core.match :refer [match]])
   (:import [java.io BufferedReader InputStreamReader OutputStreamWriter]
@@ -207,43 +207,45 @@
                                           :throws?        throws?}))]
     cmdr))
 
-
-(defn get-output-ssh
+(defn make-output-fn
   "Function to retrieve data from an SSHProcess and send to a DataSource
 
-  The SSHProcess will take a line of data from the output of it's child process and then put it into the
-  data-channel of the DataSource.  If there is no more data in the outputstream of the child process and
-  the child process is done, the data-channel will be closed.  Otherwise, it will loop and grab lines
-  from the outputstream and put them into the data-channel.  Finally"
-  [this {:keys [data]}]
-  (try
-    (let [chan (:channel this)
-          os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
-          out-chan (:data-channel data)
-          is-done? #(= (.getExitStatus chan) -1)
-          finish #(let [status (.getExitStatus chan)]
-                   (async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
-                   (async/close! out-chan)
-                   this)]
-      (if (not (.isConnected chan))
-        (.connect chan))
-      (timbre/info "connected? " (.isConnected chan))
-      ;; While the buffer has data read from the outputstream and shove it into the the data logger channel
-      (loop [ready? (.ready os)
-             running? (is-done?)]
-        (match [[ready? running?]]
-               ;; If process is done, and there's nothing in buffer, we're done
-               [[false false]] (finish)
-               [[false nil]] (finish)
-               ;; if process is still running, but buffer has no data, keep going
-               [[false true]] (recur (.ready os) (is-done?))
-               ;; if we've got data in the buffer, we dont care if process is done or not.  grab the data
-               [[true _]] (let [line (.readLine os)]
-                            (when line
-                              (async/>!! out-chan {:topic :stdout :message (str line "\n")}))
-                            (recur (.ready os) (is-done?))))))
-    (catch Exception ex
-      (-> (:data-channel data) async/close!))))
+   The SSHProcess will take a line of data from the output of it's child process and then put it into the
+   data-channel of the DataSource.  If there is no more data in the outputstream of the child process and
+   the child process is done, the data-channel will be closed.  Otherwise, it will loop and grab lines
+   from the outputstream and put them into the data-channel.  Finally"
+  [stream-name]
+  (fn [this {:keys [data]}]
+    (try
+      (let [ssh-chan (:channel this)
+            os (-> (stream-name this) InputStreamReader. BufferedReader.)
+            out-chan (:data-channel data)
+            is-done? #(= (.getExitStatus ssh-chan) -1)
+            finish #(let [status (.getExitStatus ssh-chan)]
+                     ;(async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
+                     (async/close! out-chan)
+                     this)]
+        (if (not (.isConnected ssh-chan))
+          (.connect ssh-chan))
+        ;; While the buffer has data read from the outputstream and shove it into the the data logger channel
+        (loop [ready? (.ready os)
+               running? (is-done?)]
+          (match [[ready? running?]]
+                 ;; If process is done, and there's nothing in buffer, we're done
+                 [[false false]] (finish)
+                 [[false nil]] (finish)
+                 ;; if process is still running, but buffer has no data, keep going
+                 [[false true]] (recur (.ready os) (is-done?))
+                 ;; if we've got data in the buffer, we dont care if process is done or not.  grab the data
+                 [[true _]] (let [line (.readLine os)]
+                              (when line
+                                (async/>!! out-chan {:topic :stdout :message (str line "\n")}))
+                              (recur (.ready os) (is-done?))))))
+      (catch Exception ex
+        (-> (:data-channel data) async/close!)))))
+
+(def get-output-ssh (make-output-fn :out-stream))
+(def get-error-ssh (make-output-fn :err-stream))
 
 ;; ==========================================================================================
 ;; SSHProcess
@@ -268,9 +270,16 @@
     (let [chan (:channel this)]
       (-> (.getOutputStream chan) OutputStreamWriter.)))
 
+  ;; Ughhh, clj-ssh does not combine stdout and stderr.  So we create another thread for
+  ;; output and one for error.  Each will pump data to the same DataBus, so the DataTap(s)
+  ;; connected to it will get from both stdout and stderr.  However, it is possible that
+  ;; one thread will run faster than the other, so the ordering of stdout and stderr may
+  ;; not be correct
   InfoProducer
   (get-output [this {:keys [data]}]
-    (get-output-ssh this {:data data})))
+    (let [f1 (future (get-output-ssh this {:data data}))
+          _ (get-error-ssh this {:data data})]
+      @f1)))
 
 
 (defn make->SSHProcess
@@ -337,6 +346,10 @@
         cmd+ (if work-dir
                (str (format "cd %s;" work-dir) cmd)
                cmd)
+        cmd+ (if env
+               (str (clojure.string/join ";" (for [[k v] env]
+                                               (format "export %s=%s" k v))) ";" cmd+)
+               cmd+)
         m {:host host :cmd cmd+ :logger logger :data-consumers logc :result-handler result-handler
            :topics topics :block? block? :env env :work-dir work-dir :throws? throws?}]
     (timbre/debug m)
@@ -376,3 +389,4 @@
     (if (= 0 (protos/get-status process))
       (clojure.string/trim (protos/output executor))
       nil)))
+
