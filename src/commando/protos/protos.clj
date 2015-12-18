@@ -46,8 +46,8 @@
 
 (defprotocol Multicaster
   (listeners [this] "Returns who is listening")
-  (tap-into [this to-chan] "Allows a channel to tap into this")
-  (untap-from [this from-chan] "Untaps a channel from this"))
+  (tap-into [this to-chan] "Allows a consumer to hook into a message bus")
+  (untap-from [this from-chan] "Untaps a consumer from the message bus"))
 
 ;; =====================================================================================
 ;; get-data takes a DataTap, and determines the destination type
@@ -70,3 +70,11 @@
   [this]
   (let [fpath (-> (:destination this) :file)]
     (slurp fpath)))
+
+;; ==========================================================================================
+;; Implementation of InfoProducer on a java.io.File
+;; ==========================================================================================
+(extend-type java.io.File
+  InfoProducer
+  (get-output [this {:keys [data]}]
+    (.read this)))

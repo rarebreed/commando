@@ -17,7 +17,16 @@
 
 
 (defn ssh
-  ""
+  "The base function used for remote calls.
+
+  *Args*
+  - host: String of the hostname or IP of remote machine
+  - cmd: String of the command to run on remote machine
+  - username: (opt) String of the user to run as (defaults as root)
+  - loglvl: (opt keyword) logging level for command
+
+  *Return*
+  "
   [host cmd & {:keys [username loglvl]
                :as opts
                :or {username "root" loglvl :info}}]
@@ -26,15 +35,6 @@
         args (->> (dissoc opts :loglvl) (items) (concat [host cmd]))]
     ;(timbre/info args)
     (apply sshc/ssh args)))
-
-;; ==========================================================================================
-;; Implementation of InfoProducer on a java.io.File
-;; ==========================================================================================
-(extend-type java.io.File
-  InfoProducer
-  (get-output [this {:keys [data]}]
-    ))
-
 
 ;; ==========================================================================================
 ;; Implementation of a Worker and InfoProducer on a java.lang.Process
@@ -74,7 +74,6 @@
 ;; ==========================================================================================
 ;; Helper functions for ProcessBuilder
 ;; ==========================================================================================
-
 (defn set-dir!
   [pb dir]
   {:pre [#(if dir (.exists dir) true)]}
@@ -124,12 +123,12 @@
    ^File work-dir                                           ;; working directory
    env                                                      ;; environment map to be used by process
    ^Boolean combine-err?                                    ;; redirect stderr to stdout?
-   ^Boolean block?
+   ^Boolean block?                                          ;; if true, wait until command completes
    logger                                                   ;; a DataStore
-   data-consumers                                           ;; a seq of DataTaps which can work on Process messages
+   data-consumers                                           ;; a map of DataTaps which can work on Process messages
    result-handler                                           ;; fn predicate to determine success
    watch-handler                                            ;; function to pass to a DataTap
-   throws?                                                  ;; if true, throw an exception if result-handler is false
+   ^Boolean throws?                                         ;; if true, throw an exception if result-handler is false
    ]
   Executor
   (call [cmdr]
@@ -147,8 +146,7 @@
                                        :status  (protos/get-status p)
                                        :output  (protos/output cmdr)}
                               hdlr (throw-wrapper (:result-handler cmdr) (:throws? cmdr))]
-                          (hdlr results)))
-          ]
+                          (hdlr results)))]
       (if (:block? cmdr)
         (get-results)
         (future (get-results)))))
@@ -179,9 +177,10 @@
 
 
 (defn make->Commander
-  "Creates a Commander object
+  "Creates a Commander object. See Commander defrecord for details on optional keys
 
-  The Commander "
+  The logger is a DataStore that the ssh process output will go to.  The data-consumers are DataTaps that will
+  receive messages from the DataStore's multicaster channel."
   [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler data-consumers topics throws?]
           :or   {combine-err?   true
                  block?         true
@@ -210,43 +209,51 @@
 
 
 (defn get-output-ssh
+  "Function to retrieve data from an SSHProcess and send to a DataSource
+
+  The SSHProcess will take a line of data from the output of it's child process and then put it into the
+  data-channel of the DataSource.  If there is no more data in the outputstream of the child process and
+  the child process is done, the data-channel will be closed.  Otherwise, it will loop and grab lines
+  from the outputstream and put them into the data-channel.  Finally"
   [this {:keys [data]}]
-  (let [chan (:channel this)
-        os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
-        out-chan (:data-channel data)
-        is-done? #(= (.getExitStatus chan) -1)
-        finish #(let [status (.getExitStatus chan)]
-                 (async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
-                 (async/close! out-chan)
-                 this)]
-    (if (not (.isConnected chan))
-      (.connect chan))
-    (timbre/info "connected? " (.isConnected chan))
-    ;; While the buffer has data read from the outputstream and shove it into the the data logger channel
-    (loop [ready? (.ready os)
-           running? (is-done?)]
-      (match [[ready? running?]]
-             ;; If process is done, and there's nothing in buffer, we're done
-             [[false false]] (finish)
-             [[false nil]] (finish)
-             ;; if process is still running, but buffer has no data, keep going
-             [[false true]] (recur (.ready os) (is-done?))
-             ;; if we've got data in the buffer, we dont care if process is done or not.  grab the data
-             [[true _]] (let [line (.readLine os)]
-                          (when line
-                            (async/>!! out-chan {:topic :stdout :message (str line "\n")}))
-                          (recur (.ready os) (is-done?)))))))
+  (try
+    (let [chan (:channel this)
+          os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
+          out-chan (:data-channel data)
+          is-done? #(= (.getExitStatus chan) -1)
+          finish #(let [status (.getExitStatus chan)]
+                   (async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
+                   (async/close! out-chan)
+                   this)]
+      (if (not (.isConnected chan))
+        (.connect chan))
+      (timbre/info "connected? " (.isConnected chan))
+      ;; While the buffer has data read from the outputstream and shove it into the the data logger channel
+      (loop [ready? (.ready os)
+             running? (is-done?)]
+        (match [[ready? running?]]
+               ;; If process is done, and there's nothing in buffer, we're done
+               [[false false]] (finish)
+               [[false nil]] (finish)
+               ;; if process is still running, but buffer has no data, keep going
+               [[false true]] (recur (.ready os) (is-done?))
+               ;; if we've got data in the buffer, we dont care if process is done or not.  grab the data
+               [[true _]] (let [line (.readLine os)]
+                            (when line
+                              (async/>!! out-chan {:topic :stdout :message (str line "\n")}))
+                            (recur (.ready os) (is-done?))))))
+    (catch Exception ex
+      (-> (:data-channel data) async/close!))))
 
 ;; ==========================================================================================
 ;; SSHProcess
-;; Represents the execution of a SSHCommand
+;; Represents the execution of a SSHCommand.
 ;; ==========================================================================================
 (defrecord SSHProcess
-  [channel
-   out-stream
+  [channel                                                  ;; SSH channel
+   out-stream                                               ;;
    err-stream
    session
-   ;; Need to add LogProducer and LogConsumers
    ]
   Worker
   (alive? [this]
@@ -274,7 +281,7 @@
 
 
 ;; ==========================================================================================
-;;
+;; SSHCommander represents how to execute remote processes
 ;; ==========================================================================================
 (defrecord SSHCommander
   [^String host                                             ;; The hostname or IP address of remote machine
@@ -283,13 +290,13 @@
    data-consumers                                           ;; A sequence of DataTaps
    result-handler                                           ;; How to determine pass/fail
    topics
-   block?
-   throws?
-   ;; TODO: add working directory and environment variables
+   block?                                                   ;; If true, block until command completes
+   throws?                                                  ;; If true, throw exception on failure
    env
-   work-dir]
-  Executor
+   work-dir                                                 ;; Working directory to issue command
+   ]
 
+  Executor
   (call [this]
     (let [host (:host this)
           cmd (:cmd this)
@@ -343,7 +350,16 @@
 
 
 (defn launch
-  "Improved way to launch a command"
+  "Factory to create either a Commander or SSHCommander object and run it's call method.
+
+  Usage:
+  ```
+      (launch \"iostat 2 5\" :block? false)
+      (launch \"iostat 2 5\")
+      (launch \"ls -al\" :host \"my-machine.foo.com\")
+      (launch \"ls -al /foo\" :throws? true)  => throws an exception
+  ```
+  "
   [cmd & {:keys [host]
           :as opts}]
   (let [command (if host
@@ -360,11 +376,3 @@
     (if (= 0 (protos/get-status process))
       (clojure.string/trim (protos/output executor))
       nil)))
-
-
-;(launch+ "ssh-add")
-
-(def code (get-code))
-
-(def status
-  [])
