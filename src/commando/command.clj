@@ -24,7 +24,7 @@
   (timbre/logf loglvl "On %s| Executing command: %s" host cmd)
   (let [opts (merge opts {:username username})
         args (->> (dissoc opts :loglvl) (items) (concat [host cmd]))]
-    (timbre/info args)
+    ;(timbre/info args)
     (apply sshc/ssh args)))
 
 ;; ==========================================================================================
@@ -60,6 +60,7 @@
         (match [[ready? running?]]
                ;; If the process isn't running and there's nothing in inp, we're done
                [[false false]] (do
+                                 (println "Process finished")
                                  (async/close! out-chan)
                                  proc)
                ;; Process is still going, but nothing is available in buffer: keep going
@@ -84,7 +85,9 @@
 (defn set-env!
   [pb env]
   (when env
-    (.environment pb env))
+    (let [environ (.environment pb)]
+      (doseq [[k v] env]
+        (.put environ k v))))
   pb)
 
 (defn combine-err!
@@ -100,10 +103,17 @@
   [cmdr]
   (:data-channel (:logger cmdr)))
 
-
 (defn default-res-hdler [res]
-  (= 0 (:out res)))
+  (= 0 (:status res)))
 
+(defn throw-wrapper
+  [handler throws?]
+  (fn [result]
+    (let [passed? (handler result)]
+      (match [[passed? throws?]]
+             [[true _]] result
+             [[false false]] result
+             [[false true]] (throw (Exception. "Failed result handler"))))))
 
 ;; ==========================================================================================
 ;; Commander
@@ -117,8 +127,9 @@
    ^Boolean block?
    logger                                                   ;; a DataStore
    data-consumers                                           ;; a seq of DataTaps which can work on Process messages
-   result-handler                                           ;; fn to determine success
+   result-handler                                           ;; fn predicate to determine success
    watch-handler                                            ;; function to pass to a DataTap
+   throws?                                                  ;; if true, throw an exception if result-handler is false
    ]
   Executor
   (call [cmdr]
@@ -128,10 +139,19 @@
                       set-dir!)
           _ (build pb (:work-dir cmdr))
           logger (get-channel cmdr)
-          proc (.start pb)]
+          proc (.start pb)
+          get-results (fn []
+                        (let [p (protos/get-output proc {:data logger})
+                              results {:executor cmdr
+                                       :process p
+                                       :status  (protos/get-status p)
+                                       :output  (protos/output cmdr)}
+                              hdlr (throw-wrapper (:result-handler cmdr) (:throws? cmdr))]
+                          (hdlr results)))
+          ]
       (if (:block? cmdr)
-        (protos/get-output proc {:data logger})
-        (future (protos/get-output proc {:data logger})))))
+        (get-results)
+        (future (get-results)))))
 
   (output [cmdr]
     (protos/get-data (-> (:data-consumers cmdr) :in-mem)))
@@ -162,12 +182,13 @@
   "Creates a Commander object
 
   The Commander "
-  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler data-consumers topics]
+  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler data-consumers topics throws?]
           :or   {combine-err?   true
                  block?         true
                  logger         (mon/make->DataBus)         ;;(mon/make->DataStore)
                  result-handler default-res-hdler
-                 topics         [:stdout]}
+                 topics         [:stdout]
+                 throws?        false}
           :as   opts}]
   (let [logc (if data-consumers
                data-consumers
@@ -183,7 +204,8 @@
                                           :logger         logger
                                           :result-handler result-handler
                                           :watch-handler  watch-handler
-                                          :data-consumers   logc}))]
+                                          :data-consumers logc
+                                          :throws?        throws?}))]
     cmdr))
 
 
@@ -258,10 +280,11 @@
   [^String host                                             ;; The hostname or IP address of remote machine
    ^String cmd                                              ;; The command to run
    logger                                                   ;; A DataStore that the SSHProcess will send data to
-   data-consumers                                            ;; A sequence of DataTaps
+   data-consumers                                           ;; A sequence of DataTaps
    result-handler                                           ;; How to determine pass/fail
    topics
    block?
+   throws?
    ;; TODO: add working directory and environment variables
    env
    work-dir]
@@ -271,11 +294,18 @@
           cmd (:cmd this)
           logger (:logger this)
           ssh-res (make->SSHProcess (ssh host cmd :out :stream))
-          block? (:block? this)]
-      (print "block is " block?)
+          block? (:block? this)
+          get-results (fn []
+                        (let [p (protos/get-output ssh-res {:data logger})
+                              results {:executor this
+                                       :process p
+                                       :status  (protos/get-status p)
+                                       :output  (protos/output this)}
+                              hdlr (throw-wrapper (:result-handler this) (:throws? this))]
+                          (hdlr results)))]
       (if block?
-        (protos/get-output ssh-res {:data logger})
-        (future (protos/get-output ssh-res {:data logger})))))
+        (get-results)
+        (future (get-results)))))
 
   (output [this]
     (protos/get-data (-> (:data-consumers this) :in-mem))))
@@ -286,11 +316,12 @@
 
   The logger is a DataStore that the ssh process output will go to.  The data-consumers are DataTaps that will
   receive messages from the DataStore's multicaster channel."
-  [host cmd & {:keys [logger data-consumers result-handler topics block? env work-dir]
+  [host cmd & {:keys [logger data-consumers result-handler topics block? env work-dir throws?]
                :or {logger (mon/make->DataBus)              ;;(mon/make->DataStore)
                     result-handler default-res-hdler
                     topics [:stdout]
-                    block? true}
+                    block? true
+                    throws? false}
                :as opts}]
   (let [logc (if data-consumers
                data-consumers
@@ -299,8 +330,8 @@
                (str (format "cd %s;" work-dir) cmd)
                cmd)
         m {:host host :cmd cmd+ :logger logger :data-consumers logc :result-handler result-handler
-           :topics topics :block? block? :env env :work-dir work-dir}]
-    (timbre/info m)
+           :topics topics :block? block? :env env :work-dir work-dir :throws? throws?}]
+    (timbre/debug m)
     (map->SSHCommander m)))
 
 
@@ -317,18 +348,17 @@
   (let [command (if host
                   (apply make->SSHCommander host cmd (reducer opts))
                   (apply make->Commander cmd (reducer opts)))]
-    (timbre/info "opts for launch are: " opts)
-    [command (protos/call command)]))
+    (timbre/debug "opts for launch are: " opts)
+    (protos/call command)))
 
-(comment
-  (defn which
-    "Determines if a program is in PATH and if so, returns the path if it exists or nil"
-    [program & {:keys [host]}]
-    (let [[cmd proc] (launch (str "which " program) :host host)
-          proc (if (future? proc) @proc proc)]
-      (if (= 0 (get-status proc))
-        (clojure.string/trim (output cmd))
-        nil))))
+(defn which
+  "Determines if a program is in PATH and if so, returns the path if it exists or nil"
+  [program & {:keys [host]}]
+  (let [{:keys [executor process]} (launch (str "which " program) :host host)
+        process (if (future? process) @process process)]
+    (if (= 0 (protos/get-status process))
+      (clojure.string/trim (protos/output executor))
+      nil)))
 
 ;(launch+ "ssh-add")
 

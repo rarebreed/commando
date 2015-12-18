@@ -88,6 +88,7 @@
 ;; A DataTap is a process which takes data out of a channel and does something with it
 ;; a Process which needs to examine log information or events should probably use this
 ;; ==========================================================================================
+;; FIXME: This is a really ugly function.  We also need a way to know that the DataTap is done
 (defn dispatcher
   "Extracts message from the publisher channel, and sends the message to its destination"
   ;; FIXME: this function is really doing 2 things.  it is extracting a message from the channel
@@ -95,31 +96,37 @@
   ;; destination.  This is really 2 processes: A) extract and process, B) send to final destination
   ;; FIXME: Probably better to make this into a protocol, and have it implemented for different
   ;; destination endpoints.  For example, extend-type StringBuilder DestWriter
-  [chan dest hdlr]
+  [datatap]
   (go
-    (loop [msg (<! chan)]
-      (if (not (nil? msg))
-        ;; FIXME: we are assuming :message is a string
-        (let [message (:message msg)
-              content (if hdlr
-                        (hdlr message)
-                        message)]
-          ;; FIXME:  matches are exclusive, ie can't match on more than one destination
-          (match [dest]
-                 [{:stdout out}] (println (clojure.string/trim-newline content))
-                 [{:file fpath}] (spit fpath content :append true)
-                 [{:socket sock}] nil                       ;; TODO
-                 [{:channel mchan}] (>! mchan content)
-                 [{:in-mem data}] (.append data content)    ;; FIXME: in-mem can be an arbitrary data type
-                 :else (timbre/error "Unknown destination type " dest))
-          (recur (<! chan)))
-        (timbre/info "Channel is closed for" (first (keys dest)))))))
+    (let [chan (:data-channel datatap)
+          dest (:destination datatap)
+          hdlr (:handler datatap)]
+      (loop [msg (<! chan)]
+        (if (nil? msg)
+          (do
+            (timbre/debug "Channel is closed for" (first (keys dest)))
+            (reset! (:closed? datatap) true))
+          ;; FIXME: we are assuming :message is a string
+          (let [message (:message msg)
+                content (if hdlr
+                          (hdlr message)
+                          message)]
+            ;; FIXME:  matches are exclusive, ie can't match on more than one destination
+            (match [dest]
+                   [{:stdout out}] (println (clojure.string/trim-newline content))
+                   [{:file fpath}] (spit fpath content :append true)
+                   [{:socket sock}] nil                     ;; TODO
+                   [{:channel mchan}] (>! mchan content)
+                   [{:in-mem data}] (.append data content)  ;; FIXME: in-mem can be an arbitrary data type
+                   :else (timbre/error "Unknown destination type " dest))
+            (recur (<! chan))))))))
 
 (defrecord DataTap
   [data-channel                                             ;; where messages from publisher will go
    destination                                              ;; where to send processed message to
    handler
    process                                                  ;; a function that takes a channel and a destination
+   closed?                                                  ;; when data-channel gets a nil value
    ])
 
 
@@ -128,16 +135,17 @@
   to the given data-channel (or a default one will be created).  A processing function will pull
   messages from the data-channel, optionally apply a handler to the message.
   "
-  [publisher & {:keys [data-channel destination handler process]
+  [publisher & {:keys [data-channel destination handler process closed?]
                 :or   {data-channel (chan 10)
                        destination  {:stdout *out*}
-                       process      dispatcher}}]
+                       process      dispatcher
+                       closed?      (atom false)}}]
   ;; Tap into the multicaster
   (async/tap publisher data-channel)
-  (let [dt (->DataTap data-channel destination handler process)
+  (let [dt (->DataTap data-channel destination handler process closed?)
         pfn (:process dt)]
     ;; create the dispatcher core.async process
-    (pfn data-channel destination handler)
+    (pfn dt)
     dt))
 
 (defn string-dispatcher

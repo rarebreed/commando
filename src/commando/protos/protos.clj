@@ -54,13 +54,15 @@
 ;; based on destination type, it can retrieve data from the DataTap
 ;; =====================================================================================
 (defmulti get-data
-          "Retrieve data from a DataTap based on destination type"
+          "Retrieve data from a DataTap based on destination type.  Note that
+          calling this function will block until the channel is closed (returns nil)"
           (fn [this]
             (let [dtype (-> (:destination this) keys first)]
               dtype)))
 
 (defmethod get-data :in-mem
   [this]
+  (while (not @(:closed? this)))
   (let [sb (-> (:destination this) :in-mem)]
     (.toString sb)))
 
