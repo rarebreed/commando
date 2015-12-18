@@ -23,6 +23,38 @@ In the future, other process mechanisms will be supported, such as the pheidippi
 
 FIXME:  Show some examples of how to use commando
 
+```
+    => (require '[commando.command :as cmdr :refer [launch]])
+
+    ;; Run in blocking mode
+    => (def result (launch "ls -al"))
+    => (clojure.pprint/pprint result)  ;; :status is exit value, and :output is the output
+
+    ;; Run in non-blocking mode (install sysstat for this)
+    => (def result (launch "iostat 2 5" :block? false))
+    => result   ;; the REPL will be be free immediately since result is now a future
+
+    ;; Throw exception on a failure
+    => (def result (launch "ls /foo" :throws? true))
+
+    ;; Call a subprocess remotely (Make sure you have copied your public key to the remote
+    ;; host, and have ssh-add the identity before running
+    (def result (launch "python -V" :host "myhost.nowhere.com"))
+
+    ;; Set a different working directory
+    (def result (launch "ls -al" :work-dir "/tmp"))
+
+
+
+    ;; Consider a call a success only if something in the output is seen
+
+    ;; DataTaps:  Are consumers of data.  they can have a handler which takes a message as an
+    ;; argument, and do something with the message.  For example, you can write a handler to
+    ;; watch for a traceback
+
+
+```
+
 ## TODO
 
 - More Windows testing

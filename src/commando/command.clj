@@ -1,16 +1,21 @@
 (ns commando.command
   (:require [taoensso.timbre :as timbre]
             [commando.core :refer [items]]
-            [clj-ssh.ssh :as sshs]
             [clj-ssh.cli :as sshc]
-            [clojure.string :refer [split]])
+            [clojure.string :refer [split]]
+            [commando.protos.protos :as protos :refer [Worker InfoProducer Executor Publisher Multicaster]]
+            [commando.monitor :as mon]
+            [clojure.core.async :as async :refer [chan pub sub]]
+            [commando.logging :refer [get-code]]
+            [clojure.core.match :refer [match]])
   (:import [java.io BufferedReader InputStreamReader OutputStreamWriter]
            [java.lang ProcessBuilder]
-           [java.io File]))
+           [java.io File]
+           ))
 
 (sshc/default-session-options {:strict-host-key-checking :no})
 
-;; NOTE: Use this function if you're working at the REPL
+
 (defn ssh
   ""
   [host cmd & {:keys [username loglvl]
@@ -19,104 +24,51 @@
   (timbre/logf loglvl "On %s| Executing command: %s" host cmd)
   (let [opts (merge opts {:username username})
         args (->> (dissoc opts :loglvl) (items) (concat [host cmd]))]
-    (timbre/info args)
+    ;(timbre/info args)
     (apply sshc/ssh args)))
 
-
-;; NOTE:  This function will not work from the REPL.  If you use this, use it from within
-;; another clojure program (is there a way to tell you are executing from the repl?)
-;; FIXME: This also doesn't appear to be working
-(comment
-  (defn ssh-p
-    "Executes a command on a remote host.
-
-    - host: hostname or IP address to execute cmd on
-    - cmd: the command to execute"
-    [^String host ^String cmd & {:keys [username loglvl pvtkey-path]
-                                 :or   {username "root" loglvl :info pvtkey-path "~/.ssh/id_auto_dsa"}}]
-    (timbre/logf loglvl "On %s| Executing command: %s" host cmd)
-    (let [agent (sshs/ssh-agent {:use-system-ssh-agent true})
-          session (sshs/session agent host {:strict-host-key-checking :no})]
-      (sshs/with-connection session
-                            (sshs/ssh session {:in cmd})))))
+;; ==========================================================================================
+;; Implementation of InfoProducer on a java.io.File
+;; ==========================================================================================
+(extend-type java.io.File
+  InfoProducer
+  (get-output [this {:keys [data]}]
+    ))
 
 
 ;; ==========================================================================================
-;; The Executor Protocol
-;; This represents how to execute a command either locally or remotely.  Remote calls could be
-;; done via SSH, uplift.messaging, or even (potentially) a REST call
-;; ==========================================================================================
-(defprotocol Executor
-  "Any object that supports execution of a system command should implement this"
-  (call [this] "Execute the process")
-  (output [this] "Get saved output of the process"))
-
-;; ==========================================================================================
-;; Worker
-;; Where Executor encapsulates behavior of _how_ to execute a process, Worker describes
-;; _what_ can be done with the process
-;; ==========================================================================================
-(defprotocol Worker
-  "API for a unit of work"
-  (alive? [this] "Is the unit of work still in progress (get it's state)")
-  (get-output [this {:keys [logged]}] "Get information from the process in real-time")
-  (get-input [this] "Send information to the process in real time")
-  ;(get-error [this] "Get any error information from the process")
-  (get-status [this] "The status of a process"))
-
-
-;; ==========================================================================================
-;; LogProducer
-;; A LogProducer is a process that emits data of some kind and puts it into a channel.  This
-;; can be used by Process types in that they will likely be producing information of interest
-;; to other Processes
-;; ==========================================================================================
-(defrecord LogProducer
-  [;; core.async channel to put lines into
-   log-channel
-   ;; a function that possibly transforms a line before being put into log-channel
-   transformer
-   ])
-
-;; ==========================================================================================
-;; LogConsumer
-;; A LogConsumer is a process which takes data out of a channel and does something with it
-;; a Process which needs to examine log information or events should probably use this
-;; ==========================================================================================
-(defrecord LogConsumer
-  [log-channel])
-
-;; ==========================================================================================
-;;
+;; Implementation of a Worker and InfoProducer on a java.lang.Process
 ;; ==========================================================================================
 (extend-type java.lang.Process
   Worker
   (alive? [this]
     (.isAlive this))
 
-  (get-output
-    [proc {:keys [logged]}]
-    (future
-      (let [inp (-> (.getInputStream proc) InputStreamReader. BufferedReader.)]
-        (loop [line (.readLine inp)
-               running? (alive? proc)]
-          ;; FIXME: abstract the println.  What if user doesn't want to print stdout or wants it to
-          ;; to go to a network channel or to a core.async channel?
-          (println line)
-          (cond line (do
-                       (when logged
-                         (.append logged (str line "\n")))
-                       (recur (.readLine inp) (alive? proc)))
-                (not running?) proc
-                :else (do
-                        (timbre/warn "unknown condition in get-output")
-                        proc))))))
-  (get-input [this]
+  (get-data-sink [this]
     (let [outp (-> (.getOutputStream this) (OutputStreamWriter.))]
       outp))
 
   (get-status [this]
-    (.exitValue this)))
+    (.exitValue this))
+
+  InfoProducer
+  (get-output [proc {:keys [data]}]
+    (let [inp (-> (.getInputStream proc) InputStreamReader. BufferedReader.)
+          out-chan data]
+      (loop [ready? (.ready inp)
+             running? (.isAlive proc)]
+        (match [[ready? running?]]
+               ;; If the process isn't running and there's nothing in inp, we're done
+               [[false false]] (do
+                                 (println "Process finished")
+                                 (async/close! out-chan)
+                                 proc)
+               ;; Process is still going, but nothing is available in buffer: keep going
+               [[false true]] (recur (.ready inp) (.isAlive proc))
+               ;; If there's something in buffer, we don't care if process is alive or not.  grab data
+               [[true _]] (let [line (.readLine inp)]
+                            (async/>!! out-chan {:topic :stdout :message (str line "\n")})
+                            (recur (.ready inp) (.isAlive proc))))))))
 
 
 ;; ==========================================================================================
@@ -133,7 +85,9 @@
 (defn set-env!
   [pb env]
   (when env
-    (.environment pb env))
+    (let [environ (.environment pb)]
+      (doseq [[k v] env]
+        (.put environ k v))))
   pb)
 
 (defn combine-err!
@@ -141,6 +95,25 @@
   (.redirectErrorStream pb combine?)
   pb)
 
+
+;; ==========================================================================================
+;; Commander related functions
+;; ==========================================================================================
+(defn get-channel
+  [cmdr]
+  (:data-channel (:logger cmdr)))
+
+(defn default-res-hdler [res]
+  (= 0 (:status res)))
+
+(defn throw-wrapper
+  [handler throws?]
+  (fn [result]
+    (let [passed? (handler result)]
+      (match [[passed? throws?]]
+             [[true _]] result
+             [[false false]] result
+             [[false true]] (throw (Exception. "Failed result handler"))))))
 
 ;; ==========================================================================================
 ;; Commander
@@ -152,9 +125,11 @@
    env                                                      ;; environment map to be used by process
    ^Boolean combine-err?                                    ;; redirect stderr to stdout?
    ^Boolean block?
-   logged!                                                  ;; holds output/err
-   result-handler                                           ;; fn to determine success
-   watch-handler                                            ;; function launched in a separate thread
+   logger                                                   ;; a DataStore
+   data-consumers                                           ;; a seq of DataTaps which can work on Process messages
+   result-handler                                           ;; fn predicate to determine success
+   watch-handler                                            ;; function to pass to a DataTap
+   throws?                                                  ;; if true, throw an exception if result-handler is false
    ]
   Executor
   (call [cmdr]
@@ -163,156 +138,233 @@
                       #(set-env! % (:env cmdr))
                       set-dir!)
           _ (build pb (:work-dir cmdr))
-          logger (:logged! cmdr)
-          proc (.start pb)]
+          logger (get-channel cmdr)
+          proc (.start pb)
+          get-results (fn []
+                        (let [p (protos/get-output proc {:data logger})
+                              results {:executor cmdr
+                                       :process p
+                                       :status  (protos/get-status p)
+                                       :output  (protos/output cmdr)}
+                              hdlr (throw-wrapper (:result-handler cmdr) (:throws? cmdr))]
+                          (hdlr results)))
+          ]
       (if (:block? cmdr)
-        @(get-output proc {:logged logger})
-        (do
-          (get-output proc {:logged logger})
-          proc))))
+        (get-results)
+        (future (get-results)))))
 
   (output [cmdr]
-    (.toString (:logged! cmdr))))
+    (protos/get-data (-> (:data-consumers cmdr) :in-mem)))
+
+  Publisher
+  (topics [this]
+    @(:topics (:logger this)))
+  (publish-to [this topic out-chan]
+    (let [logprod (:logger this)
+          publisher (:publisher logprod)]
+      (swap! (:topics logprod) conj topic)
+      (sub publisher topic out-chan)))
+
+  Multicaster
+  (listeners [this]
+    (:data-consumers this))
+
+  (tap-into [this to-chan]
+    (let [multicaster (:logger this)]
+      (async/tap multicaster to-chan)))
+
+  (untap-from [this from-chan]
+    (let [multicaster (:logger this)]
+      (async/untap multicaster from-chan))))
 
 
 (defn make->Commander
-  "Creates a Commander object"
-  [cmd & {:keys [work-dir env combine-err? block? logged! result-handler watch-handler]
+  "Creates a Commander object
+
+  The Commander "
+  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler data-consumers topics throws?]
           :or   {combine-err?   true
                  block?         true
-                 logged!        (StringBuilder. 1024)
-                 result-handler (fn [res]
-                                  (= 0 (:out res)))}
+                 logger         (mon/make->DataBus)         ;;(mon/make->DataStore)
+                 result-handler default-res-hdler
+                 topics         [:stdout]
+                 throws?        false}
           :as   opts}]
-  (map->Commander (merge opts {:cmd (if (= String (class cmd))
-                                      (split cmd #"\s+")
-                                      cmd)
-                               :work-dir (when work-dir
-                                           (File. work-dir))
-                               :combine-err? combine-err?
-                               :block? block?
-                               :logged! logged!
-                               :result-handler result-handler})))
+  (let [logc (if data-consumers
+               data-consumers
+               (commando.monitor/create-default-consumers (:multicaster logger)))
+        cmdr (map->Commander (merge opts {:cmd            (if (= String (class cmd))
+                                                            (split cmd #"\s+")
+                                                            cmd)
+                                          :work-dir       (when work-dir
+                                                            (File. work-dir))
+                                          :env            env
+                                          :combine-err?   combine-err?
+                                          :block?         block?
+                                          :logger         logger
+                                          :result-handler result-handler
+                                          :watch-handler  watch-handler
+                                          :data-consumers logc
+                                          :throws?        throws?}))]
+    cmdr))
 
 
-(defn extract!
-  "reads lines from an inputstream and copies to a stringbuilder"
-  [^BufferedReader stream ^StringBuilder logger]
-  (while (.ready stream)
-    (let [line (.readLine stream)]
-      (timbre/info line)
-      (when logger
-        (.append logger (str line "\n"))))))
-
-
-(defn get-out
-  [this {:keys [logged]}]
-  (timbre/debug "get-out: " this)
-  (future
-    (let [chan (:channel this)
-          os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
-          out-stream (-> (:out-stream this) InputStreamReader. BufferedReader.)
-          alive? #(= -1 (.getExitStatus %))]
-      (if (not (.isConnected chan))
-        (.connect chan))
-      (timbre/debug "connected? " (.isConnected chan))
-      (loop [status (alive? chan)]
-        (if status
-          ;; While the channel is still open, read the stdout that was piped to the InputStream
-          (let [line (.readLine os)]
-            (timbre/info line)
-            (when logged
-              (.append logged (str line "\n")))
-            (recur (alive? chan)))
-          ;; There might be info in the BufferedReader once the channel closes, so read it
-          (do
-            (extract! os logged)
-            (extract! out-stream logged)
-            (timbre/info "Finished with status: " (.getExitStatus chan))
-            this))))))
+(defn get-output-ssh
+  [this {:keys [data]}]
+  (let [chan (:channel this)
+        os (-> (.getInputStream chan) InputStreamReader. BufferedReader.)
+        out-chan (:data-channel data)
+        is-done? #(= (.getExitStatus chan) -1)
+        finish #(let [status (.getExitStatus chan)]
+                 (async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
+                 (async/close! out-chan)
+                 this)]
+    (if (not (.isConnected chan))
+      (.connect chan))
+    (timbre/info "connected? " (.isConnected chan))
+    ;; While the buffer has data read from the outputstream and shove it into the the data logger channel
+    (loop [ready? (.ready os)
+           running? (is-done?)]
+      (match [[ready? running?]]
+             ;; If process is done, and there's nothing in buffer, we're done
+             [[false false]] (finish)
+             [[false nil]] (finish)
+             ;; if process is still running, but buffer has no data, keep going
+             [[false true]] (recur (.ready os) (is-done?))
+             ;; if we've got data in the buffer, we dont care if process is done or not.  grab the data
+             [[true _]] (let [line (.readLine os)]
+                          (when line
+                            (async/>!! out-chan {:topic :stdout :message (str line "\n")}))
+                          (recur (.ready os) (is-done?)))))))
 
 ;; ==========================================================================================
 ;; SSHProcess
 ;; Represents the execution of a SSHCommand
 ;; ==========================================================================================
 (defrecord SSHProcess
-  [ssh-res]
+  [channel
+   out-stream
+   err-stream
+   session
+   ;; Need to add LogProducer and LogConsumers
+   ]
   Worker
-
   (alive? [this]
-    (let [chan (:channel (:ssh-res this))]
+    (let [chan (:channel this)]
       (= (.getExitStatus chan) -1)))
 
-  (get-output [this {:keys [logged]}]
-    (timbre/debug "this is: " this)
-    (get-out (:ssh-res this) {:logged logged}))
-
   (get-status [this]
-    (let [chan (:channel (:ssh-res this))]
-      (.getExitStatus chan))))
+    (let [chan (:channel this)]
+      (.getExitStatus chan)))
+
+  (get-data-sink [this]
+    (let [chan (:channel this)]
+      (-> (.getOutputStream chan) OutputStreamWriter.)))
+
+  InfoProducer
+  (get-output [this {:keys [data]}]
+    (get-output-ssh this {:data data})))
 
 
 (defn make->SSHProcess
+  "Constructor for an SSHProcess"
   [ssh-res]
-  (->SSHProcess ssh-res))
+  ;; TODO:  need to create
+  (map->SSHProcess ssh-res))
 
 
+;; ==========================================================================================
+;;
+;; ==========================================================================================
 (defrecord SSHCommander
-  [^String host
-   ^String cmd
-   ^StringBuilder logged!
-   result-handler
-   watch-handler
-   ;; TODO: what else do we need?
-   ]
+  [^String host                                             ;; The hostname or IP address of remote machine
+   ^String cmd                                              ;; The command to run
+   logger                                                   ;; A DataStore that the SSHProcess will send data to
+   data-consumers                                           ;; A sequence of DataTaps
+   result-handler                                           ;; How to determine pass/fail
+   topics
+   block?
+   throws?
+   ;; TODO: add working directory and environment variables
+   env
+   work-dir]
   Executor
 
   (call [this]
     (let [host (:host this)
           cmd (:cmd this)
-          logger (:logged! this)
-          res (ssh host cmd :out :stream)
-          ssh-res (make->SSHProcess res)]
-      (timbre/debug "ssh result:" res)
-      (timbre/debug "SSHProcess:" ssh-res)
-      (get-output ssh-res {:logged logger})))
+          logger (:logger this)
+          ssh-res (make->SSHProcess (ssh host cmd :out :stream))
+          block? (:block? this)
+          get-results (fn []
+                        (let [p (protos/get-output ssh-res {:data logger})
+                              results {:executor this
+                                       :process p
+                                       :status  (protos/get-status p)
+                                       :output  (protos/output this)}
+                              hdlr (throw-wrapper (:result-handler this) (:throws? this))]
+                          (hdlr results)))]
+      (if block?
+        (get-results)
+        (future (get-results)))))
 
   (output [this]
-    (.toString (:logged! this))))
+    (protos/get-data (-> (:data-consumers this) :in-mem))))
 
 
 (defn make->SSHCommander
-  [host cmd & {:keys [logger result-handler watch-handler]
-               :or {logger (StringBuilder. 1024)}
+  "Creates a new SSHCommander object
+
+  The logger is a DataStore that the ssh process output will go to.  The data-consumers are DataTaps that will
+  receive messages from the DataStore's multicaster channel."
+  [host cmd & {:keys [logger data-consumers result-handler topics block? env work-dir throws?]
+               :or {logger (mon/make->DataBus)              ;;(mon/make->DataStore)
+                    result-handler default-res-hdler
+                    topics [:stdout]
+                    block? true
+                    throws? false}
                :as opts}]
-  (let [m {:host host :cmd cmd :logger logger :result-handler result-handler :watch-handler watch-handler}]
-    (println m)
+  (let [logc (if data-consumers
+               data-consumers
+               (commando.monitor/create-default-consumers (:multicaster logger)))
+        cmd+ (if work-dir
+               (str (format "cd %s;" work-dir) cmd)
+               cmd)
+        m {:host host :cmd cmd+ :logger logger :data-consumers logc :result-handler result-handler
+           :topics topics :block? block? :env env :work-dir work-dir :throws? throws?}]
+    (timbre/debug m)
     (map->SSHCommander m)))
 
 
 (defn reducer [m]
   "flattens a map (one-level) by turning it into a sequence of (k1 v1 k2 v2 ..)"
-  (reduce #(concat %1 %2) []
-          (for [[k v] m]
-            [k v])))
+  (reduce #(concat %1 %2) [] (for [[k v] m]
+                               [k v])))
+
 
 (defn launch
   "Improved way to launch a command"
   [cmd & {:keys [host]
           :as opts}]
   (let [command (if host
-                  (make->SSHCommander host cmd)
+                  (apply make->SSHCommander host cmd (reducer opts))
                   (apply make->Commander cmd (reducer opts)))]
-    [command (call command)]))
-
+    (timbre/debug "opts for launch are: " opts)
+    (protos/call command)))
 
 (defn which
   "Determines if a program is in PATH and if so, returns the path if it exists or nil"
   [program & {:keys [host]}]
-  (let [[cmd proc] (launch (str "which " program) :host host)
-        proc (if (future? proc) @proc proc)]
-    (if (= 0 (get-status proc))
-      (clojure.string/trim (output cmd))
+  (let [{:keys [executor process]} (launch (str "which " program) :host host)
+        process (if (future? process) @process process)]
+    (if (= 0 (protos/get-status process))
+      (clojure.string/trim (protos/output executor))
       nil)))
 
-;(launch "ssh-add")
+
+;(launch+ "ssh-add")
+
+(def code (get-code))
+
+(def status
+  [])
