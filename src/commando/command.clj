@@ -207,45 +207,61 @@
                                           :throws?        throws?}))]
     cmdr))
 
-(defn make-output-fn
+(defn get-output-ssh
   "Function to retrieve data from an SSHProcess and send to a DataSource
 
    The SSHProcess will take a line of data from the output of it's child process and then put it into the
    data-channel of the DataSource.  If there is no more data in the outputstream of the child process and
    the child process is done, the data-channel will be closed.  Otherwise, it will loop and grab lines
-   from the outputstream and put them into the data-channel.  Finally"
-  [stream-name]
-  (fn [this {:keys [data]}]
-    (try
-      (let [ssh-chan (:channel this)
-            os (-> (stream-name this) InputStreamReader. BufferedReader.)
-            out-chan (:data-channel data)
-            is-done? #(= (.getExitStatus ssh-chan) -1)
-            finish #(let [status (.getExitStatus ssh-chan)]
-                     ;(async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
-                     (async/close! out-chan)
-                     this)]
-        (if (not (.isConnected ssh-chan))
-          (.connect ssh-chan))
-        ;; While the buffer has data read from the outputstream and shove it into the the data logger channel
-        (loop [ready? (.ready os)
-               running? (is-done?)]
+   from the outputstream and put them into the data-channel."
+  [this {:keys [data]}]
+  (try
+    (let [ssh-chan (:channel this)
+          os (-> (:out-stream this) InputStreamReader. BufferedReader.)
+          err (-> (:err-stream this) InputStreamReader. BufferedReader.)
+          out-chan (:data-channel data)
+          is-done? #(= (.getExitStatus ssh-chan) -1)
+          finish #(let [status (.getExitStatus ssh-chan)]
+                   ;(async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
+                   (loop [out? (.ready os)
+                          error? (.ready err)]
+                     (let [ready? (or out? error?)
+                           o (when out? (.readLine os))
+                           e (when error? (.readLine err))]
+                       (when ready?
+                         (doseq [line [o e] :when (not (nil? line))]
+                           (async/>!! out-chan {:topic :stdout :message (str line "\n")}))
+                         (recur (.ready os) (.ready err)))))
+                   (async/close! out-chan)
+                   this)]
+      (when-not (.isConnected ssh-chan)
+        (println "connecting to ssh channel")
+        (.connect ssh-chan))
+      ;; While the buffer has data read from the outputstream and shove it into the the data logger channel
+      (loop [os? (.ready os)
+             err? (.ready err)
+             running? (is-done?)]
+        (let [ready? (or os? err?)]
           (match [[ready? running?]]
                  ;; If process is done, and there's nothing in buffer, we're done
                  [[false false]] (finish)
-                 [[false nil]] (finish)
+                 [[false nil]] (do (println "got nil for running? ") (finish))
                  ;; if process is still running, but buffer has no data, keep going
-                 [[false true]] (recur (.ready os) (is-done?))
+                 [[false true]] (recur (.ready os) (.ready err) (is-done?))
                  ;; if we've got data in the buffer, we dont care if process is done or not.  grab the data
-                 [[true _]] (let [line (.readLine os)]
-                              (when line
+                 [[true _]] (let [lines (match [os? err?]
+                                               [true false] [(.readLine os)]
+                                               [true true] [(.readLine os) (.readLine err)]
+                                               [false false] []
+                                               [false true] [(.readLine err)])]
+                              (doseq [line lines]
                                 (async/>!! out-chan {:topic :stdout :message (str line "\n")}))
-                              (recur (.ready os) (is-done?))))))
-      (catch Exception ex
-        (-> (:data-channel data) async/close!)))))
+                              (recur (.ready os) (.ready err) (is-done?)))))))
+    (catch Exception ex
+      (-> (:data-channel data) async/close!))))
 
-(def get-output-ssh (make-output-fn :out-stream))
-(def get-error-ssh (make-output-fn :err-stream))
+;(def get-output-ssh (make-output-fn :out-stream))
+;(def get-error-ssh (make-output-fn :err-stream))
 
 ;; ==========================================================================================
 ;; SSHProcess
@@ -277,9 +293,7 @@
   ;; not be correct
   InfoProducer
   (get-output [this {:keys [data]}]
-    (let [f1 (future (get-output-ssh this {:data data}))
-          _ (get-error-ssh this {:data data})]
-      @f1)))
+    (get-output-ssh this {:data data})))
 
 
 (defn make->SSHProcess
@@ -390,3 +404,5 @@
       (clojure.string/trim (protos/output executor))
       nil)))
 
+
+(launch "ssh-add")

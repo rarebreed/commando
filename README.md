@@ -28,9 +28,15 @@ FIXME:  Show some examples of how to use commando
 
     ;; Run in blocking mode
     => (def result (launch "ls -al"))
-    => (clojure.pprint/pprint result)  ;; :status is exit value, and :output is the output
+    => (clojure.pprint/pprint result)
+
+    ;; :status is exit value, and :output is the output
+    (require '[commando.protos.protos :as protos])
+    (protos/output result)
+    (protos/
 
     ;; Run in non-blocking mode (install sysstat for this)
+    ;; Also, run ssh-add command before any ssh session
     => (def result (launch "iostat 2 5" :block? false))
     => result   ;; the REPL will be be free immediately since result is now a future
 
@@ -43,7 +49,6 @@ FIXME:  Show some examples of how to use commando
 
     ;; Set a different working directory
     (def result (launch "ls -al" :work-dir "/tmp"))
-
 
 
     ;; Consider a call a success only if something in the output is seen
@@ -63,8 +68,8 @@ FIXME:  Show some examples of how to use commando
   - Use the LogProducer and LogConsumer for handling streams of output/error
   - Some processes might wrap a ref/agent/atom and supply a watch function
 - result handler functionality
-  - throw on failures
-  - create a default handler (assume exit status of 0 is pass)
+  - ~throw on failures~
+  - ~create a default handler (assume exit status of 0 is pass)~
 - Unit tests
 
 ## License
