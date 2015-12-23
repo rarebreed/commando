@@ -223,6 +223,7 @@
           is-done? #(= (.getExitStatus ssh-chan) -1)
           finish #(let [status (.getExitStatus ssh-chan)]
                    ;(async/>!! out-chan {:topic :stdout :message (format "Finished with status: " status)})
+                   (Thread/sleep 20)
                    (loop [out? (.ready os)
                           error? (.ready err)]
                      (let [ready? (or out? error?)
