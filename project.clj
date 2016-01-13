@@ -1,6 +1,6 @@
-(defproject commando "0.1.1-SNAPSHOT"
-  :description "FIXME: write description"
-  :url "http://example.com/FIXME"
+(defproject commando "0.1.2-SNAPSHOT"
+  :description "A set of libraries to run subprocesses either locally or remotely via ssh"
+  :url "https://github.com/rarebreed/commando"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[org.clojure/clojure "1.7.0"]
