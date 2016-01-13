@@ -2,7 +2,8 @@
   (:require [clojure.core.async :as async :refer [go chan >! >!! <! <!! pub sub mult]]
             [commando.protos.protos :as protos :refer [InfoProducer]]
             [clojure.core.match :refer [match]]
-            [taoensso.timbre :as timbre])
+            [taoensso.timbre :as timbre]
+            [commando.config.logging])
   (:import [java.nio.file.StandardWatchEventKinds ]))
 
 ;; TODO: get the current time
@@ -180,6 +181,14 @@
   to an in-memory data structure.  However, if the size of the String grows too large, any excess will
   be dropped"
   [])
+
+(defn make-default-consumer-type
+  [keytype]
+  (let [dest (match keytype
+                    :stdout [{keytype *out*}]
+                    :file [{keytype *default-log*} :data-channel (chan (async/sliding-buffer 100))]
+                    :in-mem [{keytype (StringBuilder.)}])]
+    (into [:destination] dest)))
 
 (defn create-default-consumers
   "Creates DataTaps based on destinations.  By default, creates one for showing data to stdout, and
