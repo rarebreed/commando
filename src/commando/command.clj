@@ -1,5 +1,6 @@
 (ns commando.command
   (:require [taoensso.timbre :as timbre]
+            [commando.config.logging]
             [commando.core :refer [items]]
             [clj-ssh.cli :as sshc]
             [clojure.string :refer [split]]
@@ -181,17 +182,22 @@
 
   The logger is a DataStore that the ssh process output will go to.  The data-consumers are DataTaps that will
   receive messages from the DataStore's multicaster channel."
-  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler data-consumers topics throws?]
+  [cmd & {:keys [work-dir env combine-err? block? logger result-handler watch-handler data-consumers topics throws?
+                 show-out?]
           :or   {combine-err?   true
                  block?         true
                  logger         (mon/make->DataBus)         ;;(mon/make->DataStore)
                  result-handler default-res-hdler
                  topics         [:stdout]
-                 throws?        false}
+                 throws?        true
+                 show-out?      true}
           :as   opts}]
-  (let [logc (if data-consumers
-               data-consumers
-               (commando.monitor/create-default-consumers (:multicaster logger)))
+  (let [create-consumers (partial commando.monitor/create-default-consumers (:multicaster logger))
+        logc (match [data-consumers show-out?]
+                    [(:or nil false) true] (create-consumers)
+                    [(:or nil false) false] (create-consumers [(commando.monitor/make-default-consumer-type :in-mem)
+                                                     (commando.monitor/make-default-consumer-type :file)])
+                    :else data-consumers)
         cmdr (map->Commander (merge opts {:cmd            (if (= String (class cmd))
                                                             (split cmd #"\s+")
                                                             cmd)
