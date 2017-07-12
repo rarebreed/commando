@@ -14,7 +14,8 @@
            [java.io File]
            ))
 
-(sshc/default-session-options {:strict-host-key-checking :no})
+(sshc/default-session-options {:strict-host-key-checking :no
+                               })
 
 
 (defn ssh
@@ -323,6 +324,7 @@
    block?                                                   ;; If true, block until command completes
    throws?                                                  ;; If true, throw exception on failure
    env
+   ^String user
    work-dir                                                 ;; Working directory to issue command
    ]
 
@@ -331,7 +333,7 @@
     (let [host (:host this)
           cmd (:cmd this)
           logger (:logger this)
-          ssh-res (make->SSHProcess (ssh host cmd :out :stream))
+          ssh-res (make->SSHProcess (ssh host cmd :out :stream :username (:user this)))
           block? (:block? this)
           get-results (fn []
                         (let [p (protos/get-output ssh-res {:data logger})
@@ -354,12 +356,13 @@
 
   The logger is a DataStore that the ssh process output will go to.  The data-consumers are DataTaps that will
   receive messages from the DataStore's multicaster channel."
-  [host cmd & {:keys [logger data-consumers result-handler topics block? env work-dir throws?]
+  [host cmd & {:keys [user logger data-consumers result-handler topics block? env work-dir throws?]
                :or {logger (mon/make->DataBus)              ;;(mon/make->DataStore)
                     result-handler default-res-hdler
                     topics [:stdout]
                     block? true
-                    throws? false}
+                    throws? false
+                    user "root"}
                :as opts}]
   (let [logc (if data-consumers
                data-consumers
@@ -372,7 +375,7 @@
                                                (format "export %s=%s" k v))) ";" cmd+)
                cmd+)
         m {:host host :cmd cmd+ :logger logger :data-consumers logc :result-handler result-handler
-           :topics topics :block? block? :env env :work-dir work-dir :throws? throws?}]
+           :topics topics :block? block? :env env :work-dir work-dir :throws? throws? :user user}]
     (timbre/debug m)
     (map->SSHCommander m)))
 

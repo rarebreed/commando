@@ -53,7 +53,7 @@
         publisher (if publisher
                     publisher
                     (cond (= :publisher ctype) (pub data-channel :topic)
-                          (= :multicaseter ctype) (mult data-channel)
+                          (= :multicaster ctype) (mult data-channel)
                           :else (do
                                   (timbre/error "Invalid :ctype")
                                   (pub data-channel :topic))))
